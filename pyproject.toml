@@ -1,0 +1,7 @@
+[project]
+name = "convertfs"
+version = "0.1.0"
+description = "File format conversion as a FUSE filesystem"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
