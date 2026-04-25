@@ -9,3 +9,14 @@ dependencies = [
     "pyvips>=3.1.1",
     "trio>=0.33.0",
 ]
+
+[project.scripts]
+convertfs = "convertfs.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "convertfs"
+module-root = ""

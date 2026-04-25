@@ -84,7 +84,7 @@ wheels = [
 [[package]]
 name = "convertfs"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "pyfuse3" },
     { name = "pyvips" },
@@ -97,9 +97,6 @@ requires-dist = [
     { name = "pyvips", specifier = ">=3.1.1" },
     { name = "trio", specifier = ">=0.33.0" },
 ]
-
-[package.metadata.requires-dev]
-dev = []
 
 [[package]]
 name = "idna"
