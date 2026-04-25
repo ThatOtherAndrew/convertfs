@@ -14,6 +14,9 @@
       name = "convertfs";
       packages = with pkgs; [
         uv
+
+        pkg-config
+        fuse3
       ];
     };
   };
