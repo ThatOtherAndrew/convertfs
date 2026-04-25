@@ -1,9 +1,5 @@
-let
-  name = "convertfs";
+{
   description = "File format conversion as a FUSE filesystem";
-  system = "x86_64-linux";
-in {
-  inherit description;
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -11,10 +7,11 @@ in {
 
   outputs = { self, nixpkgs }:
   let
+    system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};
   in {
     devShells.${system}.default = pkgs.mkShell {
-      inherit name;
+      name = "convertfs";
       packages = with pkgs; [
         uv
       ];
