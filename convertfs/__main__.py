@@ -2,7 +2,7 @@ import logging
 from argparse import ArgumentParser
 from pathlib import Path
 
-from convertfs.converters.dummy import DummyConverter
+from convertfs.converters import discover_converters
 from convertfs.main import ConvertFS
 
 
@@ -19,7 +19,8 @@ def main() -> None:
     )
 
     convertfs = ConvertFS(args.mount_dir)
-    convertfs.add_converter(DummyConverter())
+    for converter in discover_converters():
+        convertfs.add_converter(converter)
     convertfs.run()
 
 

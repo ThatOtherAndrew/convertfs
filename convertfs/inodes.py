@@ -40,13 +40,14 @@ class Entry:
     # For VIRTUAL_FILE: the source file's inode (used to invoke the converter
     # on read and to evict virtuals when the source is removed).
     source_inode: int | None = None
-    # In-memory file content (REAL_FILE only).
-    content: bytearray = field(default_factory=bytearray)
-    # Times in nanoseconds.
+    # Times in nanoseconds. Used for purely virtual entities (root, synthetic
+    # dirs, virtual files). For real files/dirs, the FUSE layer reads these
+    # from the underlying filesystem via fstat/stat with dir_fd.
     atime_ns: int = 0
     mtime_ns: int = 0
     ctime_ns: int = 0
     # File mode permission bits (the type bits are derived from kind).
+    # Same caveat: only authoritative for purely virtual entities.
     perm: int = 0o644
     # Whether this directory was synthesised by a converter's OUTPUT_DIRS
     # declaration. Synthesised dirs are auto-removed when they become empty.

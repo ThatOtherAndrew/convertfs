@@ -1,10 +1,26 @@
+"""FUSE Operations implementation backed by a real on-disk directory.
+
+The mountpoint is *also* the source directory. We hold a directory fd
+(`underlying_fd`) opened before pyfuse3 mounted FUSE over the path, and use
+*at-syscalls relative to it for all real-file I/O. This lets us read and
+write the underlying inode even though the path is shadowed by FUSE for
+everyone else.
+
+The InodeStore mirrors the on-disk tree as Entries, plus virtual entries
+synthesised by converters. Real entries point to a relative path under
+`underlying_fd`; virtual entries trigger their converter on read.
+"""
+
+from __future__ import annotations
+
 import errno
 import logging
 import os
 import stat
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from time import time_ns
+from typing import TYPE_CHECKING
 
 import pyfuse3
 import trio
@@ -23,52 +39,216 @@ from pyfuse3 import (
 )
 from typing_extensions import override
 
-from convertfs.converter import Converter
 from convertfs.inodes import Entry, EntryKind, InodeStore
 from convertfs.resolver import OutputEntry, resolve_outputs
 
-_ATTR_TIMEOUT = 5.0
-_ENTRY_TIMEOUT = 5.0
+if TYPE_CHECKING:
+    from convertfs.converter import Converter
+
+_ATTR_TIMEOUT = 1.0
+_ENTRY_TIMEOUT = 1.0
+
+
+@dataclass
+class _OpenHandle:
+    """Per-open-call state. One per `open`/`create` call."""
+
+    inode: int
+    # For real files: the fd we opened with openat(). None for virtuals.
+    fd: int | None = None
+    # For virtual files: the materialised bytes, lazily populated on first
+    # read and reused for the lifetime of the handle.
+    materialised: bytes | None = None
 
 
 class FUSE(Operations):
-    def __init__(self, ctime: int, converters: list[Converter]) -> None:
+    def __init__(
+        self,
+        ctime: int,
+        converters: list[Converter],
+        underlying_fd: int,
+    ) -> None:
         super().__init__()
         self.ctime = ctime
         self.converters = converters
         self.logger = logging.getLogger('convertfs.fuse')
         self.inodes = InodeStore(ctime)
+        self.underlying_fd = underlying_fd
+
+        # Open file handles, keyed by an integer we allocate.
+        self._open_handles: dict[int, _OpenHandle] = {}
+        self._next_handle: int = 1
+
+        # Run the eager scan of the underlying directory before any FUSE
+        # ops can arrive. (pyfuse3 hasn't started its loop yet at this
+        # point — Operations.__init__ is called synchronously during
+        # ConvertFS.run() before pyfuse3.init.)
+        self._scan_initial_tree()
+
+    # ---- helpers ----
+
+    def _alloc_handle(self, handle: _OpenHandle) -> int:
+        hid = self._next_handle
+        self._next_handle += 1
+        self._open_handles[hid] = handle
+        return hid
+
+    def _release_handle(self, hid: int) -> None:
+        handle = self._open_handles.pop(hid, None)
+        if handle is None:
+            return
+        if handle.fd is not None:
+            try:
+                os.close(handle.fd)
+            except OSError as exc:
+                self.logger.warning('error closing fd %d: %s', handle.fd, exc)
+
+    def _underlying_relpath(self, entry: Entry) -> str:
+        """Return the path of `entry` relative to the underlying dir-fd.
+
+        The empty string represents the root of the underlying directory.
+        """
+        path = self.inodes.path_for(entry.inode)
+        if path is None or path == Path():
+            return ''
+        return path.as_posix()
+
+    def _stat_underlying(self, entry: Entry) -> os.stat_result | None:
+        """os.stat the underlying file/dir for a real entry.
+
+        Returns None if the file no longer exists or is not accessible.
+        """
+        relpath = self._underlying_relpath(entry)
+        try:
+            if relpath == '':
+                return os.fstat(self.underlying_fd)
+            return os.stat(
+                relpath, dir_fd=self.underlying_fd, follow_symlinks=False,
+            )
+        except OSError:
+            return None
 
     # ---- attribute helpers ----
 
     def _make_attrs(self, entry: Entry) -> EntryAttributes:
         attrs = EntryAttributes()
         attrs.st_ino = entry.inode
-        attrs.st_atime_ns = entry.atime_ns
-        attrs.st_ctime_ns = entry.ctime_ns
-        attrs.st_mtime_ns = entry.mtime_ns
         attrs.st_uid = os.getuid()
         attrs.st_gid = os.getgid()
         attrs.attr_timeout = _ATTR_TIMEOUT
         attrs.entry_timeout = _ENTRY_TIMEOUT
+        attrs.st_nlink = 2 if entry.kind == EntryKind.DIRECTORY else 1
+
+        # For real files/dirs, prefer the underlying filesystem's metadata.
+        backed = (
+            entry.kind in (EntryKind.REAL_FILE, EntryKind.DIRECTORY)
+            and not entry.is_synthetic
+        )
+        backed_stat = self._stat_underlying(entry) if backed else None
+
+        if backed_stat is not None:
+            attrs.st_mode = backed_stat.st_mode
+            attrs.st_size = backed_stat.st_size
+            attrs.st_atime_ns = backed_stat.st_atime_ns
+            attrs.st_mtime_ns = backed_stat.st_mtime_ns
+            attrs.st_ctime_ns = backed_stat.st_ctime_ns
+            return attrs
+
+        # Purely virtual entity: use the entry's stored values.
+        attrs.st_atime_ns = entry.atime_ns or self.ctime
+        attrs.st_mtime_ns = entry.mtime_ns or self.ctime
+        attrs.st_ctime_ns = entry.ctime_ns or self.ctime
 
         if entry.kind == EntryKind.DIRECTORY:
             attrs.st_mode = stat.S_IFDIR | (entry.perm & 0o7777)
             attrs.st_size = 0
-            attrs.st_nlink = 2
-        elif entry.kind == EntryKind.REAL_FILE:
+        elif entry.kind == EntryKind.VIRTUAL_FILE:
             attrs.st_mode = stat.S_IFREG | (entry.perm & 0o7777)
-            attrs.st_size = len(entry.content)
-            attrs.st_nlink = 1
+            # Real size only known after conversion; report a large sentinel
+            # so tools like `cat` keep reading until our `read` returns EOF.
+            attrs.st_size = 1 << 32
         else:
-            # Virtual files: real size is unknown until conversion runs. We
-            # report a large placeholder so tools like `cat` will keep
-            # reading until our `read` returns EOF (an empty bytes), rather
-            # than truncating at 0.
+            # A real file but we couldn't stat it — fall back to zero.
             attrs.st_mode = stat.S_IFREG | (entry.perm & 0o7777)
-            attrs.st_size = 1 << 32  # 4 GiB: arbitrary large sentinel
-            attrs.st_nlink = 1
+            attrs.st_size = 0
         return attrs
+
+    # ---- initial scan ----
+
+    def _scan_initial_tree(self) -> None:
+        """Walk the underlying directory and register all real entries.
+
+        After this, real-file and real-directory entries exist in the
+        InodeStore, and virtual outputs have been registered for each.
+        """
+        self.logger.info('scanning underlying directory...')
+        count_dirs = 0
+        count_files = 0
+
+        # BFS so parents are created before children.
+        # Each queue item is (parent_entry, parent_relpath).
+        queue: list[tuple[Entry, str]] = [(self.inodes.root(), '')]
+        now = time_ns()
+        while queue:
+            parent_entry, parent_relpath = queue.pop(0)
+            try:
+                if parent_relpath == '':
+                    names = sorted(os.listdir(self.underlying_fd))
+                else:
+                    names = sorted(
+                        _listdir_at(self.underlying_fd, parent_relpath),
+                    )
+            except OSError as exc:
+                self.logger.warning(
+                    'cannot list %r in underlying dir: %s', parent_relpath, exc,
+                )
+                continue
+
+            for name in names:
+                child_relpath = (
+                    name if parent_relpath == '' else f'{parent_relpath}/{name}'
+                )
+                try:
+                    child_stat = os.stat(
+                        child_relpath,
+                        dir_fd=self.underlying_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    self.logger.warning(
+                        'cannot stat %r: %s', child_relpath, exc,
+                    )
+                    continue
+
+                if stat.S_ISLNK(child_stat.st_mode):
+                    # Hide symlinks for v1.
+                    continue
+
+                if stat.S_ISDIR(child_stat.st_mode):
+                    child_entry = self.inodes.add_directory(
+                        parent_entry,
+                        name,
+                        now_ns=now,
+                        perm=child_stat.st_mode & 0o7777,
+                        is_synthetic=False,
+                    )
+                    count_dirs += 1
+                    queue.append((child_entry, child_relpath))
+                elif stat.S_ISREG(child_stat.st_mode):
+                    real_entry = self.inodes.add_file(
+                        parent_entry,
+                        name,
+                        EntryKind.REAL_FILE,
+                        now_ns=now,
+                        perm=child_stat.st_mode & 0o7777,
+                    )
+                    self._register_outputs_for(real_entry, now_ns=now)
+                    count_files += 1
+                # Other types (sockets, fifos, devs) ignored.
+
+        self.logger.info(
+            'scan complete: %d dirs, %d files', count_dirs, count_files,
+        )
 
     # ---- conversion-trigger logic ----
 
@@ -81,15 +261,11 @@ class FUSE(Operations):
         if not outputs:
             return
 
-        # Outputs from the resolver are expressed relative to the source
-        # file's containing directory (the templates only see the leaf
-        # name). Anchor them there so `subdir/foo.txt` produces
-        # `subdir/foo.txt.copy`, not `foo.txt.copy` at the mount root.
         anchor = (
             mount_path.parent if mount_path.parent != mount_path else Path()
         )
 
-        self.logger.info(
+        self.logger.debug(
             'registering %d virtual outputs for %s', len(outputs), mount_path,
         )
         for output in outputs:
@@ -113,9 +289,7 @@ class FUSE(Operations):
         parent_path = (
             absolute.parent if absolute.parent != absolute else Path()
         )
-        # Skip outputs whose path equals an existing real file (e.g. a
-        # PNG-to-PNG identity output for a real PNG); we don't want to shadow
-        # the real file with a virtual entry.
+        # Skip outputs whose path equals an existing real file (real wins).
         existing = self.inodes.by_path(absolute)
         if existing is not None and existing.kind == EntryKind.REAL_FILE:
             return
@@ -130,7 +304,6 @@ class FUSE(Operations):
             now_ns=now_ns,
             source_inode=real_entry.inode,
         )
-        self.logger.debug('  + %s', absolute)
 
     def _find_converter(self, source_name: str) -> Converter | None:
         for converter in self.converters:
@@ -140,34 +313,30 @@ class FUSE(Operations):
         return None
 
     async def _materialise_virtual(self, virtual: Entry) -> bytes:
-        """Run the matching converter against the source's in-memory content."""
+        """Run the matching converter against the source's on-disk path."""
         if virtual.source_inode is None:
             raise pyfuse3.FUSEError(errno.EIO)
         source = self.inodes.get(virtual.source_inode)
         if source is None or source.kind != EntryKind.REAL_FILE:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        source_name = source.name
-        converter = self._find_converter(source_name)
+        converter = self._find_converter(source.name)
         if converter is None:
             raise pyfuse3.FUSEError(errno.EIO)
 
         virtual_path = self.inodes.path_for(virtual.inode)
-        if virtual_path is None:
+        source_relpath = self._underlying_relpath(source)
+        if virtual_path is None or source_relpath == '':
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        # Write the source bytes to a temp file so the converter (which
-        # works with on-disk paths) can read it. Pass `requested` as a
-        # mount-relative-style path with the right suffix so the converter
-        # can disambiguate output formats.
+        # Build an absolute path to the source on the underlying FS by way
+        # of /proc/self/fd, so the converter can read it directly. This
+        # works even though the mountpoint is shadowed by FUSE: /proc/self/fd
+        # bypasses the mount namespace's directory mapping for our process.
+        proc_path = f'/proc/self/fd/{self.underlying_fd}/{source_relpath}'
+
         def _run() -> bytes:
-            with tempfile.NamedTemporaryFile(
-                suffix=Path(source_name).suffix or '',
-                delete=True,
-            ) as src_tmp:
-                src_tmp.write(bytes(source.content))
-                src_tmp.flush()
-                return converter.process(Path(src_tmp.name), virtual_path)
+            return converter.process(Path(proc_path), virtual_path)
 
         try:
             return await trio.to_thread.run_sync(_run)
@@ -264,6 +433,16 @@ class FUSE(Operations):
         if self.inodes.child(parent, name_str) is not None:
             raise pyfuse3.FUSEError(errno.EEXIST)
 
+        # Create the directory on the underlying filesystem first.
+        parent_relpath = self._underlying_relpath(parent)
+        new_relpath = (
+            name_str if parent_relpath == '' else f'{parent_relpath}/{name_str}'
+        )
+        try:
+            os.mkdir(new_relpath, mode=mode & 0o777, dir_fd=self.underlying_fd)
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+
         now = time_ns()
         new_dir = self.inodes.add_directory(
             parent,
@@ -291,6 +470,14 @@ class FUSE(Operations):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
         if target.children:
             raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+
+        # Synthetic dirs don't exist on disk; just detach in-memory.
+        if not target.is_synthetic:
+            relpath = self._underlying_relpath(target)
+            try:
+                os.rmdir(relpath, dir_fd=self.underlying_fd)
+            except OSError as exc:
+                raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
         self.inodes.remove(target)
 
     @override
@@ -305,15 +492,19 @@ class FUSE(Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         target = self.inodes.child(parent, name_str)
         if target is None:
-            # Idempotent: if the target is already gone (e.g. cascaded away
-            # when its source was unlinked earlier in a `rm -r`), don't
-            # fail. The kernel may have a stale readdir cache.
+            # Idempotent: cascaded virtual already removed elsewhere.
             return
         if target.kind == EntryKind.DIRECTORY:
             raise pyfuse3.FUSEError(errno.EISDIR)
-        # Real files cascade to their derivatives via InodeStore.remove.
-        # Virtual files just disappear (a re-touch of the source would
-        # reinstate them, but we don't currently auto-recreate).
+
+        if target.kind == EntryKind.REAL_FILE:
+            relpath = self._underlying_relpath(target)
+            try:
+                os.unlink(relpath, dir_fd=self.underlying_fd)
+            except OSError as exc:
+                raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+
+        # Detach in-memory; cascades virtuals if real.
         self.inodes.remove(target)
 
     @override
@@ -332,6 +523,9 @@ class FUSE(Operations):
             'rename: %d/%s -> %d/%s',
             parent_inode_old, old_name, parent_inode_new, new_name,
         )
+        if flags != 0:
+            # RENAME_NOREPLACE / RENAME_EXCHANGE: not yet supported.
+            raise pyfuse3.FUSEError(errno.EINVAL)
 
         old_parent = self.inodes.get(parent_inode_old)
         new_parent = self.inodes.get(parent_inode_new)
@@ -343,20 +537,46 @@ class FUSE(Operations):
         target = self.inodes.child(old_parent, old_name)
         if target is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
+        if target.kind == EntryKind.VIRTUAL_FILE:
+            # Renaming a virtual file makes no sense (it's regenerated from
+            # a real source on read).
+            raise pyfuse3.FUSEError(errno.EROFS)
 
-        # Refuse to overwrite an existing entry at the destination.
         existing = self.inodes.child(new_parent, new_name)
         if existing is not None and existing.inode != target.inode:
             if existing.kind == EntryKind.DIRECTORY:
                 raise pyfuse3.FUSEError(errno.EISDIR)
-            # Replace the existing destination file.
+            # Will be replaced; let the underlying os.rename do the dirty
+            # work, then drop our in-memory record.
+            if existing.kind == EntryKind.REAL_FILE:
+                # We'll let os.rename overwrite it on disk too.
+                pass
             self.inodes.remove(existing)
+
+        # Do the on-disk rename for real entries (synthetic dirs don't
+        # exist on disk).
+        if not (target.kind == EntryKind.DIRECTORY and target.is_synthetic):
+            old_parent_relpath = self._underlying_relpath(old_parent)
+            new_parent_relpath = self._underlying_relpath(new_parent)
+            old_relpath = (
+                old_name if old_parent_relpath == ''
+                else f'{old_parent_relpath}/{old_name}'
+            )
+            new_relpath = (
+                new_name if new_parent_relpath == ''
+                else f'{new_parent_relpath}/{new_name}'
+            )
+            try:
+                os.rename(
+                    old_relpath, new_relpath,
+                    src_dir_fd=self.underlying_fd,
+                    dst_dir_fd=self.underlying_fd,
+                )
+            except OSError as exc:
+                raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
 
         now = time_ns()
         self.inodes.move(target, new_parent, new_name, now_ns=now)
-
-        # Re-run the resolver on real files in case the new name matches a
-        # different set of converter inputs.
         if target.kind == EntryKind.REAL_FILE:
             self._register_outputs_for(target, now_ns=now)
 
@@ -381,31 +601,45 @@ class FUSE(Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         existing = self.inodes.child(parent, name_str)
+        if existing is not None and existing.kind != EntryKind.REAL_FILE:
+            raise pyfuse3.FUSEError(errno.EEXIST)
+
+        # Open/create on the underlying filesystem.
+        parent_relpath = self._underlying_relpath(parent)
+        relpath = (
+            name_str if parent_relpath == ''
+            else f'{parent_relpath}/{name_str}'
+        )
+        # Ensure O_CREAT is set for create; honour O_TRUNC.
+        open_flags = (flags | os.O_CREAT) & ~os.O_EXCL
+        try:
+            fd = os.open(
+                relpath,
+                open_flags,
+                mode & 0o777,
+                dir_fd=self.underlying_fd,
+            )
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+
         now = time_ns()
-        if existing is not None:
-            if existing.kind != EntryKind.REAL_FILE:
-                # Refuse to overwrite a directory or virtual file via create.
-                raise pyfuse3.FUSEError(errno.EEXIST)
-            real_file = existing
-        else:
-            real_file = self.inodes.add_file(
+        if existing is None:
+            real_entry = self.inodes.add_file(
                 parent,
                 name_str,
                 EntryKind.REAL_FILE,
                 now_ns=now,
                 perm=mode & 0o777,
             )
+        else:
+            real_entry = existing
 
-        # If O_TRUNC was requested, clear the buffer.
-        if flags & os.O_TRUNC:
-            real_file.content = bytearray()
-            real_file.mtime_ns = now
+        self._register_outputs_for(real_entry, now_ns=now)
 
-        # Discover/refresh virtual outputs for this file.
-        self._register_outputs_for(real_file, now_ns=now)
-
-        attrs = self._make_attrs(real_file)
-        return FileInfo(fh=FileHandleT(real_file.inode)), attrs
+        handle = _OpenHandle(inode=real_entry.inode, fd=fd)
+        hid = self._alloc_handle(handle)
+        attrs = self._make_attrs(real_entry)
+        return FileInfo(fh=FileHandleT(hid)), attrs
 
     @override
     async def open(
@@ -417,54 +651,80 @@ class FUSE(Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.kind == EntryKind.DIRECTORY:
             raise pyfuse3.FUSEError(errno.EISDIR)
-        if entry.kind == EntryKind.VIRTUAL_FILE and (flags & 0x3) != os.O_RDONLY:
-            # Virtual files are read-only.
-            raise pyfuse3.FUSEError(errno.EROFS)
-        if entry.kind == EntryKind.REAL_FILE and (flags & os.O_TRUNC):
-            entry.content = bytearray()
-            entry.mtime_ns = time_ns()
-        return FileInfo(fh=FileHandleT(inode))
+
+        if entry.kind == EntryKind.VIRTUAL_FILE:
+            if (flags & 0x3) != os.O_RDONLY:
+                raise pyfuse3.FUSEError(errno.EROFS)
+            handle = _OpenHandle(inode=entry.inode, fd=None)
+            hid = self._alloc_handle(handle)
+            return FileInfo(fh=FileHandleT(hid))
+
+        # Real file: open on the underlying filesystem via the dir-fd.
+        relpath = self._underlying_relpath(entry)
+        try:
+            fd = os.open(relpath, flags, dir_fd=self.underlying_fd)
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+        handle = _OpenHandle(inode=entry.inode, fd=fd)
+        hid = self._alloc_handle(handle)
+        return FileInfo(fh=FileHandleT(hid))
 
     @override
     async def read(self, fh: FileHandleT, off: int, size: int) -> bytes:
         self.logger.debug('read: handle %d (off %d, size %d)', fh, off, size)
-        entry = self.inodes.get(int(fh))
+        handle = self._open_handles.get(int(fh))
+        if handle is None:
+            raise pyfuse3.FUSEError(errno.EBADF)
+
+        if handle.fd is not None:
+            # Real file.
+            try:
+                return os.pread(handle.fd, size, off)
+            except OSError as exc:
+                raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+
+        # Virtual file.
+        entry = self.inodes.get(handle.inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        if entry.kind == EntryKind.REAL_FILE:
-            return bytes(entry.content[off : off + size])
-        if entry.kind == EntryKind.VIRTUAL_FILE:
-            data = await self._materialise_virtual(entry)
-            return data[off : off + size]
-        raise pyfuse3.FUSEError(errno.EISDIR)
+        if handle.materialised is None:
+            handle.materialised = await self._materialise_virtual(entry)
+        return handle.materialised[off : off + size]
 
     @override
     async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int:
         self.logger.debug('write: handle %d (off %d, len %d)', fh, off, len(buf))
-        entry = self.inodes.get(int(fh))
-        if entry is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-        if entry.kind != EntryKind.REAL_FILE:
-            raise pyfuse3.FUSEError(errno.EROFS)
-
-        end = off + len(buf)
-        if end > len(entry.content):
-            entry.content.extend(b'\x00' * (end - len(entry.content)))
-        entry.content[off:end] = buf
-        entry.mtime_ns = time_ns()
-        return len(buf)
+        handle = self._open_handles.get(int(fh))
+        if handle is None or handle.fd is None:
+            raise pyfuse3.FUSEError(errno.EBADF)
+        try:
+            return os.pwrite(handle.fd, buf, off)
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
 
     @override
     async def flush(self, fh: FileHandleT) -> None:
         self.logger.debug('flush: handle %d', fh)
+        # No-op: we already write through to the underlying FS on each write.
 
     @override
     async def fsync(self, fh: FileHandleT, datasync: bool) -> None:
         self.logger.debug('fsync: handle %d (datasync=%s)', fh, datasync)
+        handle = self._open_handles.get(int(fh))
+        if handle is None or handle.fd is None:
+            return
+        try:
+            if datasync:
+                os.fdatasync(handle.fd)
+            else:
+                os.fsync(handle.fd)
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
 
     @override
     async def release(self, fh: FileHandleT) -> None:
         self.logger.debug('release: handle %d', fh)
+        self._release_handle(int(fh))
 
     @override
     async def setattr(
@@ -480,25 +740,84 @@ class FUSE(Operations):
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        now = time_ns()
-        if fields.update_size and entry.kind == EntryKind.REAL_FILE:
-            new_size = attr.st_size
-            current_size = len(entry.content)
-            if new_size < current_size:
-                del entry.content[new_size:]
-            elif new_size > current_size:
-                entry.content.extend(b'\x00' * (new_size - current_size))
-            entry.mtime_ns = now
-        if fields.update_mode:
-            entry.perm = attr.st_mode & 0o7777
-            entry.ctime_ns = now
-        if fields.update_atime:
-            entry.atime_ns = attr.st_atime_ns
-        if fields.update_mtime:
-            entry.mtime_ns = attr.st_mtime_ns
+        # Determine where to apply changes: prefer fh's fd if open, else
+        # use the relpath via the dir-fd.
+        fd: int | None = None
+        if fh is not None:
+            handle = self._open_handles.get(int(fh))
+            if handle is not None:
+                fd = handle.fd
+
+        is_real = (
+            entry.kind == EntryKind.REAL_FILE
+            or (entry.kind == EntryKind.DIRECTORY and not entry.is_synthetic)
+        )
+        relpath = self._underlying_relpath(entry) if is_real else None
+
+        try:
+            if fields.update_size and entry.kind == EntryKind.REAL_FILE:
+                if fd is not None:
+                    os.ftruncate(fd, attr.st_size)
+                elif relpath is not None:
+                    # Open just to truncate; close immediately.
+                    tfd = os.open(
+                        relpath, os.O_WRONLY, dir_fd=self.underlying_fd,
+                    )
+                    try:
+                        os.ftruncate(tfd, attr.st_size)
+                    finally:
+                        os.close(tfd)
+            if fields.update_mode:
+                if is_real and relpath is not None:
+                    if fd is not None:
+                        os.fchmod(fd, attr.st_mode & 0o7777)
+                    else:
+                        os.chmod(
+                            relpath,
+                            attr.st_mode & 0o7777,
+                            dir_fd=self.underlying_fd,
+                            follow_symlinks=False,
+                        )
+                entry.perm = attr.st_mode & 0o7777
+            if fields.update_atime or fields.update_mtime:
+                # We can only set both atomically; fill in the missing one
+                # from current state.
+                cur = self._stat_underlying(entry) if is_real else None
+                atime_ns = (
+                    attr.st_atime_ns if fields.update_atime
+                    else (cur.st_atime_ns if cur else entry.atime_ns)
+                )
+                mtime_ns = (
+                    attr.st_mtime_ns if fields.update_mtime
+                    else (cur.st_mtime_ns if cur else entry.mtime_ns)
+                )
+                if is_real and relpath is not None:
+                    if fd is not None:
+                        os.utime(fd, ns=(atime_ns, mtime_ns))
+                    else:
+                        os.utime(
+                            relpath,
+                            ns=(atime_ns, mtime_ns),
+                            dir_fd=self.underlying_fd,
+                            follow_symlinks=False,
+                        )
+                entry.atime_ns = atime_ns
+                entry.mtime_ns = mtime_ns
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+
         return self._make_attrs(entry)
 
     @override
     async def forget(self, inode_list: list[tuple[InodeT, int]]) -> None:
         self.logger.debug('forget: %s', inode_list)
         # We don't currently evict entries; the kernel can ask again later.
+
+
+def _listdir_at(dir_fd: int, relpath: str) -> list[str]:
+    """List entries in a subdirectory of `dir_fd`."""
+    sub_fd = os.open(relpath, os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd)
+    try:
+        return os.listdir(sub_fd)
+    finally:
+        os.close(sub_fd)
