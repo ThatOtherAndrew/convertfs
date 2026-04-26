@@ -60,11 +60,30 @@ def test_video_compressor_h264_rejects_unknown_target_pattern(tmp_path: Path) ->
 		VideoCompresserH264().process(source, tmp_path / 'resolutions' / 'clip.mp4')
 
 
+def test_video_compressor_h264_quality_profile_keeps_aspect_ratio_and_codec(tmp_path: Path) -> None:
+	source = tmp_path / 'clip.mp4'
+	_make_noise_mp4(source, width=320, height=160)
+
+	requested = tmp_path / 'quality' / 'clip.medium.mp4'
+	output = VideoCompresserH264().process(source, requested)
+
+	with av.open(io.BytesIO(output), mode='r') as container:
+		video_stream = next(stream for stream in container.streams if stream.type == 'video')
+		assert (video_stream.codec_context.width, video_stream.codec_context.height) == (320, 160)
+		assert video_stream.codec_context.name == 'h264'
+
+
 def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 	converter = VideoCompresserH264()
 	attempted: list[str] = []
+	monkeypatch.setattr(converter, '_encoder_candidates', lambda: ('h264_nvenc', 'h264_qsv', 'libx264'))
 
-	def fake_compress(source: Path, target_short_side: int, encoder_name: str) -> bytes:
+	def fake_compress(
+		source: Path,
+		encoder_name: str,
+		target_short_side: int | None = None,
+		quality_profile: dict[str, str | int] | None = None,
+	) -> bytes:
 		attempted.append(encoder_name)
 		if encoder_name == 'libx264':
 			return b'final-output'
@@ -75,4 +94,4 @@ def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypat
 	output = converter.process(tmp_path / 'source.mp4', tmp_path / 'resolutions' / 'clip.240p.mp4')
 
 	assert output == b'final-output'
-	assert attempted == ['h264_nvenc', 'h264_qsv', 'h264_v4l2m2m', 'libx264']
+	assert attempted == ['h264_nvenc', 'h264_qsv', 'libx264']
