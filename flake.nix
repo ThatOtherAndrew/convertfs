@@ -17,6 +17,7 @@
 
         pkg-config
         fuse3
+        vips
       ];
     };
   };
