@@ -13,7 +13,7 @@ from convertfs.fuse import FUSE
 class ConvertFS(pyfuse3.Operations):
     def __init__(self, mount_dir: Path) -> None:
         self.mount_dir = mount_dir.resolve()
-        self.converters = []
+        self.converters: list[Converter] = []
         self.logger = logging.getLogger('convertfs')
 
     def add_converter(self, converter: Converter) -> None:
@@ -35,7 +35,7 @@ class ConvertFS(pyfuse3.Operations):
                 return
 
     def run(self) -> None:
-        fuse = FUSE(time_ns())
+        fuse = FUSE(time_ns(), self.converters)
         options = set(pyfuse3.default_options)
         options.add('auto_unmount')
 
