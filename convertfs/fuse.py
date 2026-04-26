@@ -5,12 +5,14 @@ import stat
 import pyfuse3
 from pyfuse3 import (
     EntryAttributes,
+    FileHandleT,
     FileInfo,
     FileNameT,
     FlagT,
     InodeT,
     ModeT,
     Operations,
+    ReaddirToken,
     RequestContext,
 )
 from typing_extensions import override
@@ -40,6 +42,19 @@ class FUSE(Operations):
         return entry
 
     @override
+    async def lookup(
+        self, parent_inode: InodeT, name: FileNameT, ctx: RequestContext
+    ) -> EntryAttributes: ...
+
+    @override
+    async def opendir(self, inode: InodeT, ctx: RequestContext) -> FileHandleT: ...
+
+    @override
+    async def readdir(
+        self, fh: FileHandleT, start_id: int, token: ReaddirToken
+    ) -> None: ...
+
+    @override
     async def create(
         self,
         parent_inode: InodeT,
@@ -50,3 +65,15 @@ class FUSE(Operations):
     ) -> tuple[FileInfo, EntryAttributes]:
         print('New file created:', name)
         return FileInfo(), EntryAttributes()
+        # TODO: actually implement this
+
+    @override
+    async def open(
+        self, inode: InodeT, flags: FlagT, ctx: RequestContext
+    ) -> FileInfo: ...
+
+    @override
+    async def read(self, fh: FileHandleT, off: int, size: int) -> bytes: ...
+
+    @override
+    async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int: ...
