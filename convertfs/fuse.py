@@ -24,6 +24,7 @@ class FUSE(Operations):
     @override
     async def getattr(self, inode: InodeT, ctx: RequestContext) -> EntryAttributes:
         entry = EntryAttributes()
+        entry.st_ino = inode
         entry.st_atime_ns = self.ctime
         entry.st_ctime_ns = self.ctime
         entry.st_mtime_ns = self.ctime
