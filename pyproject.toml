@@ -12,6 +12,11 @@ dependencies = [
     "typing-extensions>=4.15.0",
 ]
 
+[dependency-groups]
+test = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 convertfs = "convertfs.__main__:main"
 
