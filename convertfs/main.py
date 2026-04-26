@@ -1,3 +1,4 @@
+import signal
 from pathlib import Path
 from time import time_ns
 
@@ -16,12 +17,30 @@ class ConvertFS(pyfuse3.Operations):
     def add_converter(self, converter: Converter) -> None:
         self.converters.append(converter)
 
-    def run(self) -> None:
-        print('Running')
+    async def _serve(self) -> None:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(self._watch_signals, nursery.cancel_scope)
+            nursery.start_soon(pyfuse3.main)
 
+    async def _watch_signals(self, cancel_scope: trio.CancelScope) -> None:
+        with trio.open_signal_receiver(
+            signal.SIGINT, signal.SIGTERM, signal.SIGHUP
+        ) as signals:
+            async for signum in signals:
+                name = signal.Signals(signum).name
+                print(f'\nconvertfs: received {name}, unmounting...')
+                cancel_scope.cancel()
+                return
+
+    def run(self) -> None:
         fuse = FUSE(time_ns())
-        pyfuse3.init(fuse, self.mount_dir.as_posix(), set(pyfuse3.default_options))
+        options = set(pyfuse3.default_options)
+        options.add('auto_unmount')
+
+        pyfuse3.init(fuse, self.mount_dir.as_posix(), options)
+        print(f'convertfs: mounted on {self.mount_dir}')
+
         try:
-            trio.run(pyfuse3.main)
+            trio.run(self._serve)
         finally:
             pyfuse3.close(unmount=True)
