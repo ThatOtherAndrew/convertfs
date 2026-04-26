@@ -1,0 +1,8 @@
+// Project tasks configuration. See https://zed.dev/docs/tasks for documentation.
+[
+  {
+    "label": "convertfs convert",
+    "command": "convertfs",
+    "args": ["convert"],
+  },
+]
