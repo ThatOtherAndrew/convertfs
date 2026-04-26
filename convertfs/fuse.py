@@ -1,3 +1,5 @@
+import errno
+import os
 import stat
 
 import pyfuse3
@@ -15,13 +17,25 @@ from typing_extensions import override
 
 
 class FUSE(Operations):
+    def __init__(self, ctime: int) -> None:
+        super().__init__()
+        self.ctime = ctime
+
     @override
     async def getattr(self, inode: InodeT, ctx: RequestContext) -> EntryAttributes:
-        print('Stat root')
         entry = EntryAttributes()
+        entry.st_atime_ns = self.ctime
+        entry.st_ctime_ns = self.ctime
+        entry.st_mtime_ns = self.ctime
+        entry.st_uid = os.getuid()
+        entry.st_gid = os.getgid()
+
         if inode == pyfuse3.ROOT_INODE:
             entry.st_mode = stat.S_IFDIR | 0o755
             entry.st_size = 0
+        else:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
         return entry
 
     @override
