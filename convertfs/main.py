@@ -30,8 +30,11 @@ class ConvertFS:
     def add_converter(self, converter: Converter) -> None:
         self.converters.append(converter)
 
-    async def _serve(self) -> None:
+    async def _serve(self, fuse: FUSE) -> None:
         async with trio.open_nursery() as nursery:
+            # Hand the FUSE instance the nursery so it can spawn its own
+            # background tasks (e.g. debounced source-consumption).
+            fuse.nursery = nursery
             nursery.start_soon(self._watch_signals, nursery.cancel_scope)
             nursery.start_soon(pyfuse3.main)
 
@@ -79,7 +82,7 @@ class ConvertFS:
             self.logger.info('mounted on %s', self.mount_dir)
 
             try:
-                trio.run(self._serve)
+                trio.run(self._serve, fuse)
             finally:
                 pyfuse3.close(unmount=True)
         finally:

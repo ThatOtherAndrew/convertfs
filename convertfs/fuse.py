@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 _ATTR_TIMEOUT = 1.0
 _ENTRY_TIMEOUT = 1.0
+_CONSUME_DEBOUNCE_S = 0.5
 
 
 @dataclass
@@ -56,6 +57,19 @@ class _OpenHandle:
     inode: int
     # For real files: the fd we opened with openat(). None for virtuals.
     fd: int | None = None
+    # For virtual files only: the inode of the source file. Recorded at
+    # open-time so release() can decrement the per-source open-handle
+    # count without having to re-look it up (the entry might be gone by
+    # then if the virtual was concurrently cascaded away).
+    virtual_source_inode: int | None = None
+
+
+@dataclass
+class _PendingConsume:
+    """Bookkeeping for a debounced source-consume task."""
+
+    source_inode: int
+    cancel_scope: trio.CancelScope
 
 
 class FUSE(Operations):
@@ -75,6 +89,16 @@ class FUSE(Operations):
         # Open file handles, keyed by an integer we allocate.
         self._open_handles: dict[int, _OpenHandle] = {}
         self._next_handle: int = 1
+
+        # Drag-out detection state. Per-source counters tell us whether any
+        # derivatives are currently open; per-source pending consume tasks
+        # let us debounce and cancel-on-related-activity.
+        self._open_derivative_count: dict[int, int] = {}
+        self._pending_consume: dict[int, _PendingConsume] = {}
+
+        # Set externally (by ConvertFS._serve) once the trio nursery exists.
+        # Used to spawn debounced consume tasks.
+        self.nursery: trio.Nursery | None = None
 
         # Run the eager scan of the underlying directory before any FUSE
         # ops can arrive. (pyfuse3 hasn't started its loop yet at this
@@ -104,19 +128,173 @@ class FUSE(Operations):
         """Drop cached converter outputs for all virtuals derived from `source_inode`.
 
         Called after a real file's content changes (write/truncate) so the
-        next read of any virtual triggers a fresh conversion.
+        next read of any virtual triggers a fresh conversion. Also resets
+        the EOF flag so a stale read from before the change isn't taken
+        as the drag-out signal.
         """
         for d_inode in self.inodes.derivatives_of(source_inode):
             d_entry = self.inodes.get(d_inode)
-            if d_entry is None or d_entry.cached_bytes is None:
+            if d_entry is None:
                 continue
+            had_cache = d_entry.cached_bytes is not None
             d_entry.cached_bytes = None
-            try:
-                pyfuse3.invalidate_inode(d_inode, attr_only=True)
-            except Exception:
-                self.logger.debug(
-                    'invalidate_inode failed for %d', d_inode, exc_info=True,
-                )
+            d_entry.was_opened_then_released = False
+            if had_cache:
+                try:
+                    pyfuse3.invalidate_inode(d_inode, attr_only=True)
+                except Exception:
+                    self.logger.debug(
+                        'invalidate_inode failed for %d', d_inode, exc_info=True,
+                    )
+        # The source content changed mid-debounce; cancel any pending consume.
+        self._cancel_pending_consume(source_inode)
+
+    # ---- drag-out detection / debounced source consumption ----
+
+    def _cancel_pending_consume(self, source_inode: int) -> None:
+        """Cancel an in-flight debounced consume for `source_inode`, if any.
+
+        Called whenever something happens that should reset the debounce
+        window: a new open of any derivative, a fresh read, or a new
+        unlink during the window.
+        """
+        pending = self._pending_consume.pop(source_inode, None)
+        if pending is not None:
+            pending.cancel_scope.cancel()
+
+    def _schedule_consume(self, source_inode: int) -> None:
+        """Schedule (or reschedule) a debounced consume of `source_inode`.
+
+        Cancels any prior scheduled consume for the same source so the
+        debounce window restarts. Spawns a Trio task that sleeps for
+        _CONSUME_DEBOUNCE_S and then, if no derivatives are open and the
+        source still exists, removes the source plus its derivatives.
+        """
+        if self.nursery is None:
+            self.logger.warning(
+                'no nursery available; consume of inode %d skipped',
+                source_inode,
+            )
+            return
+
+        # Cancel any existing scheduled consume so we restart the timer.
+        self._cancel_pending_consume(source_inode)
+
+        cancel_scope = trio.CancelScope()
+        self._pending_consume[source_inode] = _PendingConsume(
+            source_inode=source_inode,
+            cancel_scope=cancel_scope,
+        )
+        self.nursery.start_soon(
+            self._consume_after_delay, source_inode, cancel_scope,
+        )
+
+    async def _consume_after_delay(
+        self, source_inode: int, cancel_scope: trio.CancelScope,
+    ) -> None:
+        with cancel_scope:
+            await trio.sleep(_CONSUME_DEBOUNCE_S)
+        if cancel_scope.cancelled_caught:
+            self.logger.debug(
+                'consume of inode %d was cancelled before firing', source_inode,
+            )
+            return
+
+        # If the entry vanished while we slept, nothing to do.
+        source = self.inodes.get(source_inode)
+        if source is None or source.kind != EntryKind.REAL_FILE:
+            self._pending_consume.pop(source_inode, None)
+            return
+
+        # Don't consume while any derivative is still open — the file
+        # manager may be midway through reading another sibling.
+        if self._open_derivative_count.get(source_inode, 0) > 0:
+            self.logger.debug(
+                'deferring consume of inode %d: %d derivative handles open',
+                source_inode,
+                self._open_derivative_count[source_inode],
+            )
+            self._pending_consume.pop(source_inode, None)
+            return
+
+        await self._perform_consume(source_inode)
+
+    async def _perform_consume(self, source_inode: int) -> None:
+        """Delete the source file from disk and cascade-remove its derivatives."""
+        source = self.inodes.get(source_inode)
+        if source is None or source.kind != EntryKind.REAL_FILE:
+            self._pending_consume.pop(source_inode, None)
+            return
+
+        relpath = self._underlying_relpath(source)
+        path_str = self.inodes.path_for(source_inode)
+        self.logger.info(
+            'consuming source %s (inode %d) after drag-out',
+            path_str, source_inode,
+        )
+
+        # Tell the kernel to forget directory entries for derivatives
+        # before we detach them; otherwise its lookup cache lingers.
+        self._invalidate_kernel_entries_for_derivatives(source_inode)
+        # Also tell it to forget the source's own entry.
+        try:
+            pyfuse3.invalidate_entry_async(
+                source.parent_inode,
+                os.fsencode(source.name),
+                deleted=source.inode,
+                ignore_enoent=True,
+            )
+        except Exception:
+            self.logger.debug(
+                'invalidate_entry_async failed for source %d', source_inode,
+                exc_info=True,
+            )
+
+        # Remove from disk.
+        try:
+            os.unlink(relpath, dir_fd=self.underlying_fd)
+        except FileNotFoundError:
+            # Already gone (e.g. user `rm`d it manually); proceed with
+            # the in-memory cleanup anyway.
+            pass
+        except OSError as exc:
+            self.logger.warning(
+                'failed to unlink underlying %s: %s', relpath, exc,
+            )
+            self._pending_consume.pop(source_inode, None)
+            return
+
+        # Detach the source in-memory; this cascades to derivatives.
+        self.inodes.remove(source)
+        self._pending_consume.pop(source_inode, None)
+        self._open_derivative_count.pop(source_inode, None)
+
+    def _on_virtual_open(self, entry: Entry) -> None:
+        """Record that a derivative just opened; cancel pending consume."""
+        if entry.source_inode is None:
+            return
+        self._open_derivative_count[entry.source_inode] = (
+            self._open_derivative_count.get(entry.source_inode, 0) + 1
+        )
+        self._cancel_pending_consume(entry.source_inode)
+
+    def _on_virtual_release(self, handle: _OpenHandle) -> None:
+        """Mark the entry as 'extracted' and decrement open-handle count."""
+        source_inode = handle.virtual_source_inode
+        if source_inode is None:
+            return
+        # Flag that this virtual was opened-and-released. A subsequent
+        # unlink will be treated as a successful drag-out.
+        entry = self.inodes.get(handle.inode)
+        if entry is not None and entry.kind == EntryKind.VIRTUAL_FILE:
+            entry.was_opened_then_released = True
+        n = self._open_derivative_count.get(source_inode, 0) - 1
+        if n <= 0:
+            self._open_derivative_count.pop(source_inode, None)
+        else:
+            self._open_derivative_count[source_inode] = n
+
+    # ---- end drag-out detection ----
 
     def _invalidate_kernel_entries_for_derivatives(
         self, source_inode: int,
@@ -556,9 +734,30 @@ class FUSE(Operations):
             # can be told they're gone — otherwise its lookup cache will keep
             # serving them as if they still existed.
             self._invalidate_kernel_entries_for_derivatives(target.inode)
+            # If a consume was scheduled for this source, cancel it: the
+            # source is being removed explicitly so the deferred cleanup
+            # is no longer needed.
+            self._cancel_pending_consume(target.inode)
+            self.inodes.remove(target)
+            return
 
-        # Detach in-memory; cascades virtuals if real.
+        # Virtual file unlink. If the virtual was fully read, treat this as
+        # a successful drag-out: schedule a debounced consume of the source
+        # and all its remaining derivatives.
+        source_inode = target.source_inode
+        was_extracted = target.was_opened_then_released
+        # Detach this virtual immediately — the file manager has finished
+        # with it (it just unlinked it).
         self.inodes.remove(target)
+
+        if was_extracted and source_inode is not None:
+            source = self.inodes.get(source_inode)
+            if source is not None and source.kind == EntryKind.REAL_FILE:
+                self.logger.info(
+                    'drag-out detected for source inode %d; scheduling consume',
+                    source_inode,
+                )
+                self._schedule_consume(source_inode)
 
     @override
     async def rename(
@@ -717,13 +916,32 @@ class FUSE(Operations):
         if entry.kind == EntryKind.VIRTUAL_FILE:
             if (flags & 0x3) != os.O_RDONLY:
                 raise pyfuse3.FUSEError(errno.EROFS)
-            handle = _OpenHandle(inode=entry.inode, fd=None)
+            # Materialise the converter output now if not already cached.
+            # Doing it here (rather than on first read) means our st_size
+            # reflects the real size before the caller decides what to do.
+            # This is essential for applications that pre-stat to choose a
+            # copy strategy (Nautilus uses copy_file_range / splice and
+            # treats st_size=0 files as empty without calling read()).
+            if entry.cached_bytes is None:
+                entry.cached_bytes = await self._materialise_virtual(entry)
+                try:
+                    pyfuse3.invalidate_inode(entry.inode, attr_only=True)
+                except Exception:
+                    self.logger.debug(
+                        'invalidate_inode failed for %d',
+                        entry.inode, exc_info=True,
+                    )
+            handle = _OpenHandle(
+                inode=entry.inode,
+                fd=None,
+                virtual_source_inode=entry.source_inode,
+            )
             hid = self._alloc_handle(handle)
+            self._on_virtual_open(entry)
             # direct_io tells the kernel to bypass its page cache and
-            # forward every read() syscall to us, regardless of the
-            # st_size we report. Without this, the kernel sees st_size=0
-            # for an unconverted virtual file and short-circuits read()
-            # to return EOF, never giving us a chance to materialise.
+            # forward every read() syscall to us. Useful as a belt-and-
+            # braces measure: even if the kernel cached a stale st_size
+            # from an earlier stat, our read() handler is authoritative.
             return FileInfo(fh=FileHandleT(hid), direct_io=True)
 
         # Real file: open on the underlying filesystem via the dir-fd.
@@ -734,6 +952,13 @@ class FUSE(Operations):
             raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
         handle = _OpenHandle(inode=entry.inode, fd=fd)
         hid = self._alloc_handle(handle)
+        # If the file was opened with O_TRUNC, content has been zeroed.
+        # Invalidate any cached converter outputs and re-register the
+        # virtual derivatives in case some had been cleaned up earlier
+        # (e.g. by a drag-out unlink that's no longer relevant).
+        if flags & os.O_TRUNC:
+            self._invalidate_derivatives(entry.inode)
+            self._register_outputs_for(entry, now_ns=time_ns())
         return FileInfo(fh=FileHandleT(hid))
 
     @override
@@ -764,7 +989,13 @@ class FUSE(Operations):
                 self.logger.debug(
                     'invalidate_inode failed for %d', entry.inode, exc_info=True,
                 )
-        return entry.cached_bytes[off : off + size]
+        chunk = entry.cached_bytes[off : off + size]
+        # Any read also resets the debounce window — the file manager is
+        # actively pulling bytes from a sibling, so don't yank the source
+        # out from under it.
+        if entry.source_inode is not None:
+            self._cancel_pending_consume(entry.source_inode)
+        return chunk
 
     @override
     async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int:
@@ -776,8 +1007,14 @@ class FUSE(Operations):
             written = os.pwrite(handle.fd, buf, off)
         except OSError as exc:
             raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
-        # The source content changed; any cached converter outputs are stale.
+        # The source content changed; any cached converter outputs are
+        # stale, and any virtuals that were unlinked earlier (e.g. as part
+        # of a drag-out that didn't end up triggering consume) should
+        # reappear since this is fundamentally new content.
         self._invalidate_derivatives(handle.inode)
+        entry = self.inodes.get(handle.inode)
+        if entry is not None and entry.kind == EntryKind.REAL_FILE:
+            self._register_outputs_for(entry, now_ns=time_ns())
         return written
 
     @override
@@ -802,6 +1039,9 @@ class FUSE(Operations):
     @override
     async def release(self, fh: FileHandleT) -> None:
         self.logger.debug('release: handle %d', fh)
+        handle = self._open_handles.get(int(fh))
+        if handle is not None and handle.virtual_source_inode is not None:
+            self._on_virtual_release(handle)
         self._release_handle(int(fh))
 
     @override

@@ -56,6 +56,14 @@ class Entry:
     # While None, the file's reported size is 0; once populated, the size is
     # len(cached_bytes). Invalidated when the source's content changes.
     cached_bytes: bytes | None = None
+    # For VIRTUAL_FILE: True once at least one open of this virtual has
+    # been released (i.e. someone opened it and let it go). Used as the
+    # heuristic for 'was successfully extracted' before deciding whether
+    # an unlink is a drag-out vs a plain `rm`. Set on release rather than
+    # on read because some applications (e.g. Nautilus using copy_file_range
+    # / splice) never call our read handler explicitly — they get bytes
+    # via kernel-side fast paths or via the size-aware copy machinery.
+    was_opened_then_released: bool = False
 
 
 class InodeStore:
