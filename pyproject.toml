@@ -8,6 +8,7 @@ dependencies = [
     "pyfuse3>=3.4.2",
     "pyvips>=3.1.1",
     "trio>=0.33.0",
+    "typing-extensions>=4.15.0",
 ]
 
 [project.scripts]
