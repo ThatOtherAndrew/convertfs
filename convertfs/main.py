@@ -1,3 +1,4 @@
+import logging
 import signal
 from pathlib import Path
 from time import time_ns
@@ -13,6 +14,7 @@ class ConvertFS(pyfuse3.Operations):
     def __init__(self, mount_dir: Path) -> None:
         self.mount_dir = mount_dir.resolve()
         self.converters = []
+        self.logger = logging.getLogger('convertfs')
 
     def add_converter(self, converter: Converter) -> None:
         self.converters.append(converter)
@@ -28,7 +30,7 @@ class ConvertFS(pyfuse3.Operations):
         ) as signals:
             async for signum in signals:
                 name = signal.Signals(signum).name
-                print(f'\nconvertfs: received {name}, unmounting...')
+                self.logger.warning('received %s, unmounting...', name)
                 cancel_scope.cancel()
                 return
 
@@ -38,7 +40,7 @@ class ConvertFS(pyfuse3.Operations):
         options.add('auto_unmount')
 
         pyfuse3.init(fuse, self.mount_dir.as_posix(), options)
-        print(f'convertfs: mounted on {self.mount_dir}')
+        self.logger.info('mounted on %s', self.mount_dir)
 
         try:
             trio.run(self._serve)

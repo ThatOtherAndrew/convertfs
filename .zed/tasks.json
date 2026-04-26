@@ -3,6 +3,6 @@
   {
     "label": "convertfs convert",
     "command": "convertfs",
-    "args": ["convert"],
+    "args": ["convert", "--verbose"],
   },
 ]
