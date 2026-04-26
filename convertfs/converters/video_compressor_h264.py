@@ -11,7 +11,7 @@ class VideoCompresserH264(Converter):
 		INPUTS = (
 			re.compile(r'^(.*)\.(mp4|avi|mkv|mov|mxf)$'),
 		)
-		OUTPUT_DIRS = (Path('resolutions'), Path('quality'))
+		OUTPUT_DIRS = (Path('resolutions'), Path('quality'), Path('presets'))
 		OUTPUT_FILES = (
 			Path('resolutions/{}.2160p.mp4'),
 			Path('resolutions/{}.1080p.mp4'),
@@ -24,14 +24,27 @@ class VideoCompresserH264(Converter):
 			Path('quality/{}.medium.mp4'),
 			Path('quality/{}.high.mp4'),
 			Path('quality/{}.very-high.mp4'),
+			Path('presets/{}.youtube-1080p.mp4'),
+			Path('presets/{}.youtube-1440p.mp4'),
+			Path('presets/{}.youtube-2160p.mp4'),
+			Path('presets/{}.youtube-720p.mp4'),
+			Path('presets/{}.youtube-480p.mp4'),
 		)
 
 		QUALITY_PROFILES = {
-			'very-low': {'bit_rate': 400_000, 'crf': '36', 'preset': 'veryfast'},
-			'low': {'bit_rate': 800_000, 'crf': '32', 'preset': 'veryfast'},
-			'medium': {'bit_rate': 1_500_000, 'crf': '28', 'preset': 'medium'},
-			'high': {'bit_rate': 3_000_000, 'crf': '24', 'preset': 'slow'},
-			'very-high': {'bit_rate': 6_000_000, 'crf': '20', 'preset': 'slow'},
+			'very-low': {'bit_rate': 400_000, 'crf': '36', 'preset': 'veryfast', 'rate_control': 'crf'},
+			'low': {'bit_rate': 800_000, 'crf': '32', 'preset': 'veryfast', 'rate_control': 'crf'},
+			'medium': {'bit_rate': 1_500_000, 'crf': '28', 'preset': 'medium', 'rate_control': 'crf'},
+			'high': {'bit_rate': 3_000_000, 'crf': '24', 'preset': 'slow', 'rate_control': 'crf'},
+			'very-high': {'bit_rate': 6_000_000, 'crf': '20', 'preset': 'slow', 'rate_control': 'crf'},
+		}
+
+		YOUTUBE_PRESETS = {
+			'youtube-1080p': {'target_short_side': 1080, 'bit_rate': 8_000_000, 'preset': 'medium', 'rate_control': 'cbr'},
+			'youtube-1440p': {'target_short_side': 1440, 'bit_rate': 16_000_000, 'preset': 'medium', 'rate_control': 'cbr'},
+			'youtube-2160p': {'target_short_side': 2160, 'bit_rate': 40_000_000, 'preset': 'medium', 'rate_control': 'cbr'},
+			'youtube-720p': {'target_short_side': 720, 'bit_rate': 5_000_000, 'preset': 'medium', 'rate_control': 'cbr'},
+			'youtube-480p': {'target_short_side': 480, 'bit_rate': 2_500_000, 'preset': 'medium', 'rate_control': 'cbr'},
 		}
 
 		@staticmethod
@@ -57,7 +70,7 @@ class VideoCompresserH264(Converter):
 			source: Path,
 			encoder_name: str,
 			target_short_side: int | None = None,
-			quality_profile: dict[str, str | int] | None = None,
+			encoding_profile: dict[str, str | int] | None = None,
 		) -> bytes:
 			buffer = io.BytesIO()
 
@@ -87,14 +100,29 @@ class VideoCompresserH264(Converter):
 					output_stream.height = target_height
 					output_stream.pix_fmt = 'yuv420p'
 
-					profile = quality_profile or {'bit_rate': 1_500_000, 'crf': '23', 'preset': 'medium'}
+					profile = encoding_profile or {
+						'bit_rate': 1_500_000,
+						'crf': '23',
+						'preset': 'medium',
+						'rate_control': 'crf',
+					}
 					output_stream.bit_rate = int(profile['bit_rate'])
 
 					if encoder_name == 'libx264':
-						output_stream.options = {
-							'crf': str(profile['crf']),
-							'preset': str(profile['preset']),
-						}
+						if profile.get('rate_control') == 'cbr':
+							bit_rate = str(profile['bit_rate'])
+							output_stream.options = {
+								'preset': str(profile['preset']),
+								'b:v': bit_rate,
+								'maxrate': bit_rate,
+								'minrate': bit_rate,
+								'bufsize': str(int(profile['bit_rate']) * 2),
+							}
+						else:
+							output_stream.options = {
+								'crf': str(profile['crf']),
+								'preset': str(profile['preset']),
+							}
 
 					for frame in input_container.decode(video_stream):
 						scaled_frame = frame.reformat(width=target_width, height=target_height, format='yuv420p')
@@ -109,11 +137,16 @@ class VideoCompresserH264(Converter):
 		def process(self, source: Path, requested: Path) -> bytes:
 			resolution_match = re.search(r'\.(2160|1080|720|480|360|240)p\.mp4$', requested.name)
 			quality_match = re.search(r'\.(very-low|low|medium|high|very-high)\.mp4$', requested.name)
-			if resolution_match is None and quality_match is None:
+			preset_match = re.search(r'\.(youtube-(1080|1440|2160|720|480)p)\.mp4$', requested.name)
+			if resolution_match is None and quality_match is None and preset_match is None:
 				raise ValueError(f'Unsupported output file name: {requested.name}')
 
 			target_short_side = int(resolution_match.group(1)) if resolution_match else None
-			quality_profile = self.QUALITY_PROFILES[quality_match.group(1)] if quality_match else None
+			encoding_profile = self.QUALITY_PROFILES[quality_match.group(1)] if quality_match else None
+			if preset_match:
+				preset = self.YOUTUBE_PRESETS[preset_match.group(1)]
+				target_short_side = int(preset['target_short_side'])
+				encoding_profile = preset
 			encoders = self._encoder_candidates()
 
 			last_error: Exception | None = None
@@ -123,7 +156,7 @@ class VideoCompresserH264(Converter):
 						source,
 						encoder_name,
 						target_short_side=target_short_side,
-						quality_profile=quality_profile,
+						encoding_profile=encoding_profile,
 					)
 				except Exception as exc:
 					last_error = exc

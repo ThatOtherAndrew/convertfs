@@ -73,6 +73,30 @@ def test_video_compressor_h264_quality_profile_keeps_aspect_ratio_and_codec(tmp_
 		assert video_stream.codec_context.name == 'h264'
 
 
+@pytest.mark.parametrize(
+	('requested_name', 'expected_size'),
+	[
+		('clip.youtube-480p.mp4', (960, 480)),
+		('clip.youtube-720p.mp4', (1440, 720)),
+	],
+)
+def test_video_compressor_h264_youtube_presets_apply_target_short_side(
+	tmp_path: Path,
+	requested_name: str,
+	expected_size: tuple[int, int],
+) -> None:
+	source = tmp_path / 'clip.mp4'
+	_make_noise_mp4(source, width=320, height=160)
+
+	requested = tmp_path / 'presets' / requested_name
+	output = VideoCompresserH264().process(source, requested)
+
+	with av.open(io.BytesIO(output), mode='r') as container:
+		video_stream = next(stream for stream in container.streams if stream.type == 'video')
+		assert (video_stream.codec_context.width, video_stream.codec_context.height) == expected_size
+		assert video_stream.codec_context.name == 'h264'
+
+
 def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 	converter = VideoCompresserH264()
 	attempted: list[str] = []
@@ -82,7 +106,7 @@ def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypat
 		source: Path,
 		encoder_name: str,
 		target_short_side: int | None = None,
-		quality_profile: dict[str, str | int] | None = None,
+		encoding_profile: dict[str, str | int] | None = None,
 	) -> bytes:
 		attempted.append(encoder_name)
 		if encoder_name == 'libx264':
