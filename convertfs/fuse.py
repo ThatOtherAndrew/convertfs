@@ -56,9 +56,6 @@ class _OpenHandle:
     inode: int
     # For real files: the fd we opened with openat(). None for virtuals.
     fd: int | None = None
-    # For virtual files: the materialised bytes, lazily populated on first
-    # read and reused for the lifetime of the handle.
-    materialised: bytes | None = None
 
 
 class FUSE(Operations):
@@ -102,6 +99,52 @@ class FUSE(Operations):
                 os.close(handle.fd)
             except OSError as exc:
                 self.logger.warning('error closing fd %d: %s', handle.fd, exc)
+
+    def _invalidate_derivatives(self, source_inode: int) -> None:
+        """Drop cached converter outputs for all virtuals derived from `source_inode`.
+
+        Called after a real file's content changes (write/truncate) so the
+        next read of any virtual triggers a fresh conversion.
+        """
+        for d_inode in self.inodes.derivatives_of(source_inode):
+            d_entry = self.inodes.get(d_inode)
+            if d_entry is None or d_entry.cached_bytes is None:
+                continue
+            d_entry.cached_bytes = None
+            try:
+                pyfuse3.invalidate_inode(d_inode, attr_only=True)
+            except Exception:
+                self.logger.debug(
+                    'invalidate_inode failed for %d', d_inode, exc_info=True,
+                )
+
+    def _invalidate_kernel_entries_for_derivatives(
+        self, source_inode: int,
+    ) -> None:
+        """Tell the kernel to forget directory entries for derivatives.
+
+        Must be called *before* detaching them from the InodeStore (otherwise
+        we lose the parent_inode and name needed to identify the entry).
+        Without this, the kernel's lookup cache keeps the virtuals visible
+        (e.g. `stat foo.txt.copy` returns success) even after the source has
+        been removed.
+        """
+        for d_inode in self.inodes.derivatives_of(source_inode):
+            d_entry = self.inodes.get(d_inode)
+            if d_entry is None:
+                continue
+            try:
+                pyfuse3.invalidate_entry_async(
+                    d_entry.parent_inode,
+                    os.fsencode(d_entry.name),
+                    deleted=d_entry.inode,
+                    ignore_enoent=True,
+                )
+            except Exception:
+                self.logger.debug(
+                    'invalidate_entry_async failed for %d/%s',
+                    d_entry.parent_inode, d_entry.name, exc_info=True,
+                )
 
     def _underlying_relpath(self, entry: Entry) -> str:
         """Return the path of `entry` relative to the underlying dir-fd.
@@ -164,9 +207,15 @@ class FUSE(Operations):
             attrs.st_size = 0
         elif entry.kind == EntryKind.VIRTUAL_FILE:
             attrs.st_mode = stat.S_IFREG | (entry.perm & 0o7777)
-            # Real size only known after conversion; report a large sentinel
-            # so tools like `cat` keep reading until our `read` returns EOF.
-            attrs.st_size = 1 << 32
+            # Report 0 until the converter has actually run; then the real
+            # size of the produced bytes. Tools that decide whether to
+            # call read() based on st_size (e.g. some archivers) will see
+            # 0 for unconverted files. Reads still trigger conversion via
+            # our read handler, which is when the cache populates and a
+            # subsequent stat returns the true size.
+            attrs.st_size = (
+                len(entry.cached_bytes) if entry.cached_bytes is not None else 0
+            )
         else:
             # A real file but we couldn't stat it — fall back to zero.
             attrs.st_mode = stat.S_IFREG | (entry.perm & 0o7777)
@@ -503,6 +552,10 @@ class FUSE(Operations):
                 os.unlink(relpath, dir_fd=self.underlying_fd)
             except OSError as exc:
                 raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+            # Snapshot derivative entries' (parent, name) pairs so the kernel
+            # can be told they're gone — otherwise its lookup cache will keep
+            # serving them as if they still existed.
+            self._invalidate_kernel_entries_for_derivatives(target.inode)
 
         # Detach in-memory; cascades virtuals if real.
         self.inodes.remove(target)
@@ -575,6 +628,12 @@ class FUSE(Operations):
             except OSError as exc:
                 raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
 
+        # Before move() drops the old-name derivatives, tell the kernel
+        # to forget them. Otherwise its lookup cache keeps them visible
+        # under the old name.
+        if target.kind == EntryKind.REAL_FILE:
+            self._invalidate_kernel_entries_for_derivatives(target.inode)
+
         now = time_ns()
         self.inodes.move(target, new_parent, new_name, now_ns=now)
         if target.kind == EntryKind.REAL_FILE:
@@ -633,6 +692,9 @@ class FUSE(Operations):
             )
         else:
             real_entry = existing
+            # Re-creating an existing file (with O_TRUNC, typically): any
+            # cached converter outputs from the prior content are stale.
+            self._invalidate_derivatives(real_entry.inode)
 
         self._register_outputs_for(real_entry, now_ns=now)
 
@@ -657,7 +719,12 @@ class FUSE(Operations):
                 raise pyfuse3.FUSEError(errno.EROFS)
             handle = _OpenHandle(inode=entry.inode, fd=None)
             hid = self._alloc_handle(handle)
-            return FileInfo(fh=FileHandleT(hid))
+            # direct_io tells the kernel to bypass its page cache and
+            # forward every read() syscall to us, regardless of the
+            # st_size we report. Without this, the kernel sees st_size=0
+            # for an unconverted virtual file and short-circuits read()
+            # to return EOF, never giving us a chance to materialise.
+            return FileInfo(fh=FileHandleT(hid), direct_io=True)
 
         # Real file: open on the underlying filesystem via the dir-fd.
         relpath = self._underlying_relpath(entry)
@@ -687,9 +754,17 @@ class FUSE(Operations):
         entry = self.inodes.get(handle.inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        if handle.materialised is None:
-            handle.materialised = await self._materialise_virtual(entry)
-        return handle.materialised[off : off + size]
+        if entry.cached_bytes is None:
+            entry.cached_bytes = await self._materialise_virtual(entry)
+            # Tell the kernel to drop its cached attributes for this inode
+            # so the next stat() picks up the now-known size.
+            try:
+                pyfuse3.invalidate_inode(entry.inode, attr_only=True)
+            except Exception:
+                self.logger.debug(
+                    'invalidate_inode failed for %d', entry.inode, exc_info=True,
+                )
+        return entry.cached_bytes[off : off + size]
 
     @override
     async def write(self, fh: FileHandleT, off: int, buf: bytes) -> int:
@@ -698,9 +773,12 @@ class FUSE(Operations):
         if handle is None or handle.fd is None:
             raise pyfuse3.FUSEError(errno.EBADF)
         try:
-            return os.pwrite(handle.fd, buf, off)
+            written = os.pwrite(handle.fd, buf, off)
         except OSError as exc:
             raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+        # The source content changed; any cached converter outputs are stale.
+        self._invalidate_derivatives(handle.inode)
+        return written
 
     @override
     async def flush(self, fh: FileHandleT) -> None:
@@ -767,6 +845,8 @@ class FUSE(Operations):
                         os.ftruncate(tfd, attr.st_size)
                     finally:
                         os.close(tfd)
+                # The source content changed; cached outputs are stale.
+                self._invalidate_derivatives(entry.inode)
             if fields.update_mode:
                 if is_real and relpath is not None:
                     if fd is not None:

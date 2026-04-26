@@ -52,6 +52,10 @@ class Entry:
     # Whether this directory was synthesised by a converter's OUTPUT_DIRS
     # declaration. Synthesised dirs are auto-removed when they become empty.
     is_synthetic: bool = False
+    # For VIRTUAL_FILE: the converter output, populated lazily on first read.
+    # While None, the file's reported size is 0; once populated, the size is
+    # len(cached_bytes). Invalidated when the source's content changes.
+    cached_bytes: bytes | None = None
 
 
 class InodeStore:
