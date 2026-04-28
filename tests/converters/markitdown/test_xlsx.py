@@ -18,7 +18,9 @@ def test_markitdown_documents_converts_xlsx_to_markdown(tmp_path: Path) -> None:
 	source = tmp_path / 'hello.xlsx'
 	_write_minimal_xlsx(source, 'Hello World')
 
-	result = MarkItDownDocuments().process(source, tmp_path / 'hello.md').decode('utf-8')
+	dest = tmp_path / 'out.md'
+	MarkItDownDocuments().process(source, tmp_path / 'hello.md', dest)
+	result = dest.read_text(encoding='utf-8')
 
 	assert 'Hello World' in result
 	assert result.strip()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 from pathlib import Path
 from random import Random
 
@@ -44,9 +43,10 @@ def test_video_compressor_h264_scales_by_shortest_side(
 	_make_noise_mp4(source, width=source_size[0], height=source_size[1])
 
 	requested = tmp_path / 'resolutions' / 'clip.240p.mp4'
-	output = VideoCompresserH264().process(source, requested)
+	dest = tmp_path / 'out.mp4'
+	VideoCompresserH264().process(source, requested, dest)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		video_stream = next(stream for stream in container.streams if stream.type == 'video')
 		assert (video_stream.codec_context.width, video_stream.codec_context.height) == expected_size
 		assert video_stream.codec_context.name == 'h264'
@@ -56,8 +56,9 @@ def test_video_compressor_h264_rejects_unknown_target_pattern(tmp_path: Path) ->
 	source = tmp_path / 'clip.mp4'
 	_make_noise_mp4(source, width=16, height=16)
 
+	dest = tmp_path / 'out.mp4'
 	with pytest.raises(ValueError, match='Unsupported output file name'):
-		VideoCompresserH264().process(source, tmp_path / 'resolutions' / 'clip.mp4')
+		VideoCompresserH264().process(source, tmp_path / 'resolutions' / 'clip.mp4', dest)
 
 
 def test_video_compressor_h264_quality_profile_keeps_aspect_ratio_and_codec(tmp_path: Path) -> None:
@@ -65,9 +66,10 @@ def test_video_compressor_h264_quality_profile_keeps_aspect_ratio_and_codec(tmp_
 	_make_noise_mp4(source, width=320, height=160)
 
 	requested = tmp_path / 'quality' / 'clip.medium.mp4'
-	output = VideoCompresserH264().process(source, requested)
+	dest = tmp_path / 'out.mp4'
+	VideoCompresserH264().process(source, requested, dest)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		video_stream = next(stream for stream in container.streams if stream.type == 'video')
 		assert (video_stream.codec_context.width, video_stream.codec_context.height) == (320, 160)
 		assert video_stream.codec_context.name == 'h264'
@@ -89,9 +91,10 @@ def test_video_compressor_h264_youtube_presets_apply_target_short_side(
 	_make_noise_mp4(source, width=320, height=160)
 
 	requested = tmp_path / 'presets' / requested_name
-	output = VideoCompresserH264().process(source, requested)
+	dest = tmp_path / 'out.mp4'
+	VideoCompresserH264().process(source, requested, dest)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		video_stream = next(stream for stream in container.streams if stream.type == 'video')
 		assert (video_stream.codec_context.width, video_stream.codec_context.height) == expected_size
 		assert video_stream.codec_context.name == 'h264'
@@ -104,18 +107,68 @@ def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypat
 
 	def fake_compress(
 		source: Path,
+		dest: Path,
 		encoder_name: str,
 		target_short_side: int | None = None,
 		encoding_profile: dict[str, str | int] | None = None,
-	) -> bytes:
+	) -> None:
 		attempted.append(encoder_name)
 		if encoder_name == 'libx264':
-			return b'final-output'
+			dest.write_bytes(b'final-output')
+			return
 		raise RuntimeError('encoder unavailable')
 
 	monkeypatch.setattr(converter, '_compress_with_encoder', fake_compress)
 
-	output = converter.process(tmp_path / 'source.mp4', tmp_path / 'resolutions' / 'clip.240p.mp4')
+	dest = tmp_path / 'out.mp4'
+	converter.process(tmp_path / 'source.mp4', tmp_path / 'resolutions' / 'clip.240p.mp4', dest)
 
-	assert output == b'final-output'
+	assert dest.read_bytes() == b'final-output'
 	assert attempted == ['h264_nvenc', 'h264_qsv', 'libx264']
+
+
+def test_video_compressor_h264_encoder_probe_is_cached(
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	# The class-level cache should mean _probe_encoders only runs once
+	# regardless of how many process() calls happen.
+	import convertfs.converters.video_compressor_h264 as mod
+
+	# Reset cache so prior tests don't taint this run, then count probes.
+	mod.VideoCompresserH264._encoder_cache = None
+	probe_calls = []
+	original_probe = mod.VideoCompresserH264._probe_encoders
+
+	def counting_probe() -> tuple[str, ...]:
+		probe_calls.append(1)
+		return original_probe()
+
+	monkeypatch.setattr(
+		mod.VideoCompresserH264, '_probe_encoders', staticmethod(counting_probe),
+	)
+
+	first = mod.VideoCompresserH264._encoder_candidates()
+	second = mod.VideoCompresserH264._encoder_candidates()
+	third = mod.VideoCompresserH264._encoder_candidates()
+
+	assert first == second == third
+	assert len(probe_calls) == 1
+
+
+def test_video_compressor_h264_libx264_is_always_a_candidate(
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	# The software fallback must always be present, even on hosts with
+	# no hardware encoders — otherwise process() would fail outright on
+	# CI machines without /dev/nvidiactl or /dev/dri/renderD128.
+	import convertfs.converters.video_compressor_h264 as mod
+
+	mod.VideoCompresserH264._encoder_cache = None
+	# Force every device-probe to return False.
+	monkeypatch.setattr(Path, 'exists', lambda self: False)
+
+	candidates = mod.VideoCompresserH264._encoder_candidates()
+
+	assert candidates == ('libx264',)
+	# Reset for downstream tests.
+	mod.VideoCompresserH264._encoder_cache = None
