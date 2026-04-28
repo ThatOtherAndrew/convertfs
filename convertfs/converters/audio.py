@@ -17,12 +17,14 @@ from __future__ import annotations
 import io
 import re
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
-import av
 from typing_extensions import override
 
 from convertfs.converter import Converter
+
+if TYPE_CHECKING:
+    import av
 
 _LOSSY_FORMATS = ('mp3', 'opus', 'm4a', 'aac', 'ogg')
 _ALL_FORMATS = (*_LOSSY_FORMATS, 'flac', 'wav', 'aiff')
@@ -165,6 +167,11 @@ class AudioConverter(Converter):
         rate = int(rate_override) if rate_override else int(profile['rate'])
         if bitrate is None:
             bitrate = profile.get('default_bitrate')
+
+        # Lazy: PyAV pulls the FFmpeg shared libs at import time. Defer
+        # so just having the audio converter registered doesn't pay that
+        # cost on startup.
+        import av
 
         buf = io.BytesIO()
         with av.open(str(source), 'r') as input_container:

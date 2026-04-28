@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 from xml.etree import ElementTree as ET
 
-import tomli_w
-import yaml
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -60,6 +58,11 @@ class DataConverter(Converter):
         if kind == 'json':
             return json.loads(source.read_text(encoding='utf-8'))
         if kind == 'yaml':
+            # Lazy: PyYAML's import takes noticeable time and is irrelevant
+            # for users only round-tripping json/toml/xml. tomllib is
+            # stdlib so no equivalent deferral is needed for the toml branch.
+            import yaml
+
             return yaml.safe_load(source.read_text(encoding='utf-8'))
         if kind == 'toml':
             with source.open('rb') as f:
@@ -75,6 +78,9 @@ class DataConverter(Converter):
         if kind == 'json':
             return json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
         if kind == 'yaml':
+            # Lazy: PyYAML, see _load.
+            import yaml
+
             return yaml.safe_dump(
                 data, sort_keys=False, allow_unicode=True
             ).encode('utf-8')
@@ -82,6 +88,10 @@ class DataConverter(Converter):
             if not isinstance(data, dict):
                 msg = 'TOML output requires a top-level mapping'
                 raise ValueError(msg)
+            # Lazy: tomli_w is only needed for toml output. Reads use the
+            # stdlib tomllib, so users who never produce toml don't load it.
+            import tomli_w
+
             return tomli_w.dumps(_toml_sanitize(data)).encode('utf-8')
         if kind == 'xml':
             root = _data_to_xml_element(_xml_safe_name(root_name), data)

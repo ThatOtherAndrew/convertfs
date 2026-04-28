@@ -1,11 +1,13 @@
 import re
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
-import pyvips
 from typing_extensions import override
 
 from convertfs.converter import Converter
+
+if TYPE_CHECKING:
+    import pyvips
 
 
 class ImagesConverter(Converter):
@@ -149,6 +151,12 @@ class ImagesConverter(Converter):
         if source_format == output_format:
             return source.read_bytes()
 
+        # Lazy: pyvips pulls in libvips bindings (a few MB of native code)
+        # at import time. Keep it off startup so users that never touch
+        # images don't pay for it. Python caches the import after the
+        # first call, so subsequent conversions are free.
+        import pyvips
+
         image = pyvips.Image.new_from_file(str(source), access='sequential')
         if output_format == 'jpeg':
             return image.write_to_buffer('.jpg[Q=90]')
@@ -164,6 +172,9 @@ class ImagesConverter(Converter):
             raise ValueError(msg)
         level_name, ext = match.group(1), match.group(2).replace('jpeg', 'jpg')
         q = self._QUALITY_LEVELS[level_name]
+        # Lazy: see _process_flat for rationale.
+        import pyvips
+
         image = pyvips.Image.new_from_file(str(source), access='sequential')
         return image.write_to_buffer(f'.{ext}[Q={q}]')
 
@@ -177,6 +188,9 @@ class ImagesConverter(Converter):
             raise ValueError(msg)
         size_name, ext = match.group(1), match.group(2).replace('jpeg', 'jpg')
         long_side = self._RESOLUTIONS[size_name]
+        # Lazy: see _process_flat for rationale.
+        import pyvips
+
         image = pyvips.Image.thumbnail(
             str(source), long_side, height=long_side, size='down'
         )
@@ -213,7 +227,10 @@ class ImagesConverter(Converter):
         return image.write_to_buffer(f'.png[{opts}]')
 
     @staticmethod
-    def _render_preset(source: Path, preset: dict[str, object]) -> pyvips.Image:
+    def _render_preset(source: Path, preset: dict[str, object]) -> 'pyvips.Image':
+        # Lazy: see _process_flat for rationale.
+        import pyvips
+
         box = preset.get('box')
         if isinstance(box, tuple):
             w, h = box

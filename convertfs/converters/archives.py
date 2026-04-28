@@ -17,8 +17,6 @@ import zipfile
 from pathlib import Path
 from typing import ClassVar
 
-import py7zr
-from py7zr.io import BytesIOFactory
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -134,6 +132,12 @@ def _read_zip(source: Path) -> list[tuple[str, bytes]]:
 
 
 def _read_7z(source: Path) -> list[tuple[str, bytes]]:
+    # Lazy: py7zr is only needed for .7z archives. Users who only round-trip
+    # tar/zip don't pay the import cost; standard library zipfile/tarfile
+    # cover those formats without any extra dependency loading.
+    import py7zr
+    from py7zr.io import BytesIOFactory
+
     members: list[tuple[str, bytes]] = []
     with py7zr.SevenZipFile(str(source), 'r') as z:
         factory = BytesIOFactory(limit=1024 * 1024 * 1024)
@@ -225,6 +229,10 @@ def _write_tar(
 
 
 def _write_7z(members: list[tuple[str, bytes]], level: int | None) -> bytes:
+    # Lazy: same rationale as _read_7z — py7zr stays out of startup unless
+    # the user actually asks for a .7z output.
+    import py7zr
+
     buf = io.BytesIO()
     filters: list[dict[str, int]] | None = None
     if level is not None:

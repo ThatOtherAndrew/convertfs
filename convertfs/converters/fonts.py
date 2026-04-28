@@ -13,7 +13,6 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
-from fontTools.ttLib import TTFont
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -50,6 +49,11 @@ class FontsConverter(Converter):
         src_ext = source.suffix.lstrip('.').lower()
         if src_ext == out_ext or {src_ext, out_ext} == {'ttf', 'otf'}:
             return source.read_bytes()
+
+        # Lazy: fontTools is only needed for woff/woff2 (re)wrapping; ttf/otf
+        # swaps are handled by the no-op shortcut above. Defer the import so
+        # users who never touch fonts don't pay for it on startup.
+        from fontTools.ttLib import TTFont
 
         font = TTFont(str(source))
         font.flavor = self._FLAVOR_BY_EXT[out_ext]

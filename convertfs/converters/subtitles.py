@@ -2,7 +2,6 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
-import pysubs2
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -33,6 +32,11 @@ class SubtitlesConverter(Converter):
         if format_ is None:
             msg = f'Unsupported subtitle output format: {ext}'
             raise ValueError(msg)
+
+        # Lazy: pysubs2 is only needed for actual subtitle conversions, so
+        # importing it inside process() keeps it off the startup path for
+        # users who never touch subtitle files.
+        import pysubs2
 
         subs = pysubs2.load(str(source))
         kwargs: dict[str, object] = {}

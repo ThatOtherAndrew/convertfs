@@ -2,7 +2,6 @@ import io
 import re
 from pathlib import Path
 
-import av
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -29,6 +28,11 @@ class FFMpegConverter(Converter):
 
         format_map = {'mp4': 'mp4', 'avi': 'avi', 'mkv': 'matroska'}
         output_format = format_map[output_ext]
+
+        # Lazy: PyAV pulls in the full FFmpeg shared libraries (tens of MB
+        # of native code) at import time. Defer until we actually need to
+        # remux so startup stays fast for users that never touch video.
+        import av
 
         buffer = io.BytesIO()
 

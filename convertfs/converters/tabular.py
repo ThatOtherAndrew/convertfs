@@ -13,8 +13,6 @@ import re
 from pathlib import Path
 from typing import ClassVar, Iterator
 
-import openpyxl
-from openpyxl.utils.exceptions import InvalidFileException
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -51,6 +49,11 @@ class TabularConverter(Converter):
                 yield from reader
             return
         if ext == 'xlsx':
+            # Lazy: openpyxl is only touched for xlsx I/O. csv/tsv users
+            # don't need it loaded, so keep it off the import-time path.
+            import openpyxl
+            from openpyxl.utils.exceptions import InvalidFileException
+
             try:
                 wb = openpyxl.load_workbook(
                     str(source), read_only=True, data_only=True
@@ -77,6 +80,10 @@ class TabularConverter(Converter):
             writer.writerows(rows)
             return buf.getvalue().encode('utf-8')
         if ext == 'xlsx':
+            # Lazy: see _read for the rationale — openpyxl only loads for
+            # xlsx-bound conversions.
+            import openpyxl
+
             wb = openpyxl.Workbook(write_only=True)
             ws = wb.create_sheet()
             for row in rows:
