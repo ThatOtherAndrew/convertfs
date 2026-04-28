@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 from pathlib import Path
 from random import Random
 
@@ -47,10 +46,12 @@ def test_ffmpeg_converter_produces_valid_container_headers(
 	_make_noise_mp4(source)
 
 	requested = tmp_path / requested_name
-	output = FFMpegConverter().process(source, requested)
+	dest = tmp_path / f'out-{requested_name}'
+	FFMpegConverter().process(source, requested, dest)
 
+	output = dest.read_bytes()
 	assert signature_check(output)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		assert len(container.streams) > 0
 		assert any(stream.type == 'video' for stream in container.streams)

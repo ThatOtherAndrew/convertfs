@@ -13,10 +13,12 @@ synthesised by converters. Real entries point to a relative path under
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
 import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from time import time_ns
@@ -100,6 +102,12 @@ class FUSE(Operations):
         # Used to spawn debounced consume tasks.
         self.nursery: trio.Nursery | None = None
 
+        # Tempdir for materialised converter outputs. One per FUSE instance
+        # so all derivative tempfiles can be wiped on shutdown even if some
+        # invalidations missed.
+        self._cache_dir = Path(tempfile.mkdtemp(prefix='convertfs-cache-'))
+        self.logger.debug('converter output cache dir: %s', self._cache_dir)
+
         # Run the eager scan of the underlying directory before any FUSE
         # ops can arrive. (pyfuse3 hasn't started its loop yet at this
         # point — Operations.__init__ is called synchronously during
@@ -124,6 +132,21 @@ class FUSE(Operations):
             except OSError as exc:
                 self.logger.warning('error closing fd %d: %s', handle.fd, exc)
 
+    def _drop_cached_output(self, entry: Entry) -> bool:
+        """Close + unlink the cached tempfile for `entry`. Returns True if dropped."""
+        if entry.cached_fd is None and entry.cached_path is None:
+            return False
+        if entry.cached_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(entry.cached_fd)
+            entry.cached_fd = None
+        if entry.cached_path is not None:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                entry.cached_path.unlink()
+            entry.cached_path = None
+        entry.cached_size = 0
+        return True
+
     def _invalidate_derivatives(self, source_inode: int) -> None:
         """Drop cached converter outputs for all virtuals derived from `source_inode`.
 
@@ -136,8 +159,7 @@ class FUSE(Operations):
             d_entry = self.inodes.get(d_inode)
             if d_entry is None:
                 continue
-            had_cache = d_entry.cached_bytes is not None
-            d_entry.cached_bytes = None
+            had_cache = self._drop_cached_output(d_entry)
             d_entry.was_opened_then_released = False
             if had_cache:
                 try:
@@ -386,14 +408,12 @@ class FUSE(Operations):
         elif entry.kind == EntryKind.VIRTUAL_FILE:
             attrs.st_mode = stat.S_IFREG | (entry.perm & 0o7777)
             # Report 0 until the converter has actually run; then the real
-            # size of the produced bytes. Tools that decide whether to
-            # call read() based on st_size (e.g. some archivers) will see
-            # 0 for unconverted files. Reads still trigger conversion via
-            # our read handler, which is when the cache populates and a
-            # subsequent stat returns the true size.
-            attrs.st_size = (
-                len(entry.cached_bytes) if entry.cached_bytes is not None else 0
-            )
+            # size of the materialised tempfile. Tools that decide whether
+            # to call read() based on st_size (e.g. some archivers) will
+            # see 0 for unconverted files. Reads still trigger conversion
+            # via our read handler, which is when the cache populates and
+            # a subsequent stat returns the true size.
+            attrs.st_size = entry.cached_size
         else:
             # A real file but we couldn't stat it — fall back to zero.
             attrs.st_mode = stat.S_IFREG | (entry.perm & 0o7777)
@@ -539,8 +559,13 @@ class FUSE(Operations):
                     return converter
         return None
 
-    async def _materialise_virtual(self, virtual: Entry) -> bytes:
-        """Run the matching converter against the source's on-disk path."""
+    async def _materialise_virtual(self, virtual: Entry) -> None:
+        """Run the matching converter and populate `virtual`'s tempfile cache.
+
+        On success, sets `cached_path`, `cached_fd` and `cached_size` on the
+        entry. On failure, the tempfile is unlinked and the entry's cache
+        fields remain unset.
+        """
         if virtual.source_inode is None:
             raise pyfuse3.FUSEError(errno.EIO)
         source = self.inodes.get(virtual.source_inode)
@@ -562,12 +587,21 @@ class FUSE(Operations):
         # bypasses the mount namespace's directory mapping for our process.
         proc_path = f'/proc/self/fd/{self.underlying_fd}/{source_relpath}'
 
-        def _run() -> bytes:
-            return converter.process(Path(proc_path), virtual_path)
+        # Allocate the tempfile up-front. Match the requested suffix so
+        # converters that infer format from the path (e.g. pyvips) work.
+        suffix = virtual_path.suffix
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=suffix, dir=self._cache_dir)
+        os.close(tmp_fd)
+        dest = Path(tmp_name)
+
+        def _run() -> None:
+            converter.process(Path(proc_path), virtual_path, dest)
 
         try:
-            return await trio.to_thread.run_sync(_run)
+            await trio.to_thread.run_sync(_run)
         except pyfuse3.FUSEError:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                dest.unlink()
             raise
         except Exception:
             self.logger.exception(
@@ -575,7 +609,24 @@ class FUSE(Operations):
                 type(converter).__name__,
                 virtual_path,
             )
+            with contextlib.suppress(FileNotFoundError, OSError):
+                dest.unlink()
             raise pyfuse3.FUSEError(errno.EIO) from None
+
+        try:
+            read_fd = os.open(dest, os.O_RDONLY | os.O_CLOEXEC)
+            size = os.fstat(read_fd).st_size
+        except OSError:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                dest.unlink()
+            raise pyfuse3.FUSEError(errno.EIO) from None
+
+        # Drop any prior cache (shouldn't normally happen — callers gate on
+        # cached_fd is None — but be defensive).
+        self._drop_cached_output(virtual)
+        virtual.cached_path = dest
+        virtual.cached_fd = read_fd
+        virtual.cached_size = size
 
     # ---- FUSE ops: directory / lookup ----
 
@@ -922,8 +973,8 @@ class FUSE(Operations):
             # This is essential for applications that pre-stat to choose a
             # copy strategy (Nautilus uses copy_file_range / splice and
             # treats st_size=0 files as empty without calling read()).
-            if entry.cached_bytes is None:
-                entry.cached_bytes = await self._materialise_virtual(entry)
+            if entry.cached_fd is None:
+                await self._materialise_virtual(entry)
                 try:
                     pyfuse3.invalidate_inode(entry.inode, attr_only=True)
                 except Exception:
@@ -979,8 +1030,8 @@ class FUSE(Operations):
         entry = self.inodes.get(handle.inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        if entry.cached_bytes is None:
-            entry.cached_bytes = await self._materialise_virtual(entry)
+        if entry.cached_fd is None:
+            await self._materialise_virtual(entry)
             # Tell the kernel to drop its cached attributes for this inode
             # so the next stat() picks up the now-known size.
             try:
@@ -989,7 +1040,13 @@ class FUSE(Operations):
                 self.logger.debug(
                     'invalidate_inode failed for %d', entry.inode, exc_info=True,
                 )
-        chunk = entry.cached_bytes[off : off + size]
+        if entry.cached_fd is None:
+            # Materialisation failed but didn't raise; defensive guard.
+            raise pyfuse3.FUSEError(errno.EIO)
+        try:
+            chunk = os.pread(entry.cached_fd, size, off)
+        except OSError as exc:
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
         # Any read also resets the debounce window — the file manager is
         # actively pulling bytes from a sibling, so don't yank the source
         # out from under it.
@@ -1132,6 +1189,23 @@ class FUSE(Operations):
     async def forget(self, inode_list: list[tuple[InodeT, int]]) -> None:
         self.logger.debug('forget: %s', inode_list)
         # We don't currently evict entries; the kernel can ask again later.
+
+    def shutdown(self) -> None:
+        """Release per-FUSE resources. Called by the harness after unmount."""
+        import shutil
+
+        # Close any cached output fds. The cache dir is rmtree'd below
+        # regardless, but closing fds first lets the kernel free mappings.
+        for entry in self.inodes.all_entries():
+            if entry.cached_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(entry.cached_fd)
+                entry.cached_fd = None
+            entry.cached_path = None
+            entry.cached_size = 0
+
+        with contextlib.suppress(FileNotFoundError, OSError):
+            shutil.rmtree(self._cache_dir, ignore_errors=True)
 
 
 def _listdir_at(dir_fd: int, relpath: str) -> list[str]:

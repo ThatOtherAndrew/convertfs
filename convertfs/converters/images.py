@@ -29,7 +29,7 @@ class ImagesConverter(Converter):
     }
 
     @override
-    def process(self, source: Path, requested: Path) -> bytes:
+    def process(self, source: Path, requested: Path, dest: Path) -> None:
         requested_ext = requested.suffix.lstrip('.').lower()
         if not requested_ext:
             msg = f'Requested output file has no extension: {requested.name}'
@@ -50,7 +50,5 @@ class ImagesConverter(Converter):
             raise ValueError(msg)
 
         image = pyvips.Image.new_from_file(str(source), access='sequential')
-        if output_format == 'jpeg':
-            return image.write_to_buffer('.jpg[Q=90]')
-
-        return image.write_to_buffer(f'.{output_format}')
+        target = f'{dest}[Q=90]' if output_format == 'jpeg' else str(dest)
+        image.write_to_file(target)

@@ -1,4 +1,3 @@
-import io
 import re
 from pathlib import Path
 
@@ -17,17 +16,15 @@ class FFMpegConverter(Converter):
     )
 
     @override
-    def process(self, source: Path, requested: Path) -> bytes:
+    def process(self, source: Path, requested: Path, dest: Path) -> None:
         output_ext = requested.suffix.lstrip('.')
 
         format_map = {'mp4': 'mp4', 'avi': 'avi', 'mkv': 'matroska'}
         output_format = format_map[output_ext]
 
-        buffer = io.BytesIO()
-
         with (
             av.open(str(source), 'r') as input_container,
-            av.open(buffer, 'w', format=output_format) as output_container,
+            av.open(str(dest), 'w', format=output_format) as output_container,
         ):
             stream_map = {}
             for stream in input_container.streams:
@@ -39,5 +36,3 @@ class FFMpegConverter(Converter):
                     continue
                 packet.stream = stream_map[packet.stream.index]
                 output_container.mux(packet)
-
-        return buffer.getvalue()

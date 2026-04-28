@@ -85,6 +85,7 @@ class ConvertFS:
                 trio.run(self._serve, fuse)
             finally:
                 pyfuse3.close(unmount=True)
+                fuse.shutdown()
         finally:
             with contextlib.suppress(OSError):
                 os.close(underlying_fd)

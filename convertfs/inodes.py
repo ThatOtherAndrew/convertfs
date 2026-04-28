@@ -52,10 +52,14 @@ class Entry:
     # Whether this directory was synthesised by a converter's OUTPUT_DIRS
     # declaration. Synthesised dirs are auto-removed when they become empty.
     is_synthetic: bool = False
-    # For VIRTUAL_FILE: the converter output, populated lazily on first read.
-    # While None, the file's reported size is 0; once populated, the size is
-    # len(cached_bytes). Invalidated when the source's content changes.
-    cached_bytes: bytes | None = None
+    # For VIRTUAL_FILE: the materialised converter output, populated lazily
+    # on first open. The output is held on disk in a tempfile (not in RAM)
+    # so large outputs don't pin memory; reads are served via os.pread on
+    # `cached_fd`. While None, the file's reported size is 0. Invalidated
+    # when the source's content changes.
+    cached_path: Path | None = None
+    cached_fd: int | None = None
+    cached_size: int = 0
     # For VIRTUAL_FILE: True once at least one open of this virtual has
     # been released (i.e. someone opened it and let it go). Used as the
     # heuristic for 'was successfully extracted' before deciding whether
@@ -123,6 +127,10 @@ class InodeStore:
 
     def derivatives_of(self, source_inode: int) -> set[int]:
         return self._derivatives.get(source_inode, set())
+
+    def all_entries(self) -> list[Entry]:
+        """Snapshot of every entry currently tracked. Used for shutdown sweeps."""
+        return list(self._entries.values())
 
     # ---- mutation ----
 

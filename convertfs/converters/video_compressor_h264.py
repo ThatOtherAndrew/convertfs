@@ -1,4 +1,3 @@
-import io
 import re
 from pathlib import Path
 from typing import ClassVar
@@ -120,12 +119,11 @@ class VideoCompresserH264(Converter):
     def _compress_with_encoder(
         self,
         source: Path,
+        dest: Path,
         encoder_name: str,
         target_short_side: int | None = None,
         encoding_profile: dict[str, str | int] | None = None,
-    ) -> bytes:
-        buffer = io.BytesIO()
-
+    ) -> None:
         with av.open(str(source), 'r') as input_container:
             video_stream = next(
                 (
@@ -155,7 +153,7 @@ class VideoCompresserH264(Converter):
 
             frame_rate = video_stream.average_rate or 30
 
-            with av.open(buffer, 'w', format='mp4') as output_container:
+            with av.open(str(dest), 'w', format='mp4') as output_container:
                 output_stream = output_container.add_stream(
                     encoder_name, rate=frame_rate
                 )
@@ -197,9 +195,7 @@ class VideoCompresserH264(Converter):
                 for packet in output_stream.encode():
                     output_container.mux(packet)
 
-        return buffer.getvalue()
-
-    def process(self, source: Path, requested: Path) -> bytes:
+    def process(self, source: Path, requested: Path, dest: Path) -> None:
         resolution_match = re.search(
             r'\.(2160|1080|720|480|360|240)p\.mp4$', requested.name
         )
@@ -226,14 +222,24 @@ class VideoCompresserH264(Converter):
         last_error: Exception | None = None
         for encoder_name in encoders:
             try:
-                return self._compress_with_encoder(
+                self._compress_with_encoder(
                     source,
+                    dest,
                     encoder_name,
                     target_short_side=target_short_side,
                     encoding_profile=encoding_profile,
                 )
             except Exception as exc:
                 last_error = exc
+                # Encoder failed mid-write; truncate the partial output so
+                # the next encoder candidate gets a clean file.
+                try:
+                    dest.write_bytes(b'')
+                except OSError:
+                    pass
+                continue
+            else:
+                return
 
         msg = 'No usable H.264 encoder was available'
         raise RuntimeError(msg) from last_error

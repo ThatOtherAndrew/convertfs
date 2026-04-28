@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 from pathlib import Path
 from random import Random
 
@@ -44,9 +43,10 @@ def test_video_compressor_h264_scales_by_shortest_side(
 	_make_noise_mp4(source, width=source_size[0], height=source_size[1])
 
 	requested = tmp_path / 'resolutions' / 'clip.240p.mp4'
-	output = VideoCompresserH264().process(source, requested)
+	dest = tmp_path / 'out.mp4'
+	VideoCompresserH264().process(source, requested, dest)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		video_stream = next(stream for stream in container.streams if stream.type == 'video')
 		assert (video_stream.codec_context.width, video_stream.codec_context.height) == expected_size
 		assert video_stream.codec_context.name == 'h264'
@@ -56,8 +56,9 @@ def test_video_compressor_h264_rejects_unknown_target_pattern(tmp_path: Path) ->
 	source = tmp_path / 'clip.mp4'
 	_make_noise_mp4(source, width=16, height=16)
 
+	dest = tmp_path / 'out.mp4'
 	with pytest.raises(ValueError, match='Unsupported output file name'):
-		VideoCompresserH264().process(source, tmp_path / 'resolutions' / 'clip.mp4')
+		VideoCompresserH264().process(source, tmp_path / 'resolutions' / 'clip.mp4', dest)
 
 
 def test_video_compressor_h264_quality_profile_keeps_aspect_ratio_and_codec(tmp_path: Path) -> None:
@@ -65,9 +66,10 @@ def test_video_compressor_h264_quality_profile_keeps_aspect_ratio_and_codec(tmp_
 	_make_noise_mp4(source, width=320, height=160)
 
 	requested = tmp_path / 'quality' / 'clip.medium.mp4'
-	output = VideoCompresserH264().process(source, requested)
+	dest = tmp_path / 'out.mp4'
+	VideoCompresserH264().process(source, requested, dest)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		video_stream = next(stream for stream in container.streams if stream.type == 'video')
 		assert (video_stream.codec_context.width, video_stream.codec_context.height) == (320, 160)
 		assert video_stream.codec_context.name == 'h264'
@@ -89,9 +91,10 @@ def test_video_compressor_h264_youtube_presets_apply_target_short_side(
 	_make_noise_mp4(source, width=320, height=160)
 
 	requested = tmp_path / 'presets' / requested_name
-	output = VideoCompresserH264().process(source, requested)
+	dest = tmp_path / 'out.mp4'
+	VideoCompresserH264().process(source, requested, dest)
 
-	with av.open(io.BytesIO(output), mode='r') as container:
+	with av.open(str(dest), mode='r') as container:
 		video_stream = next(stream for stream in container.streams if stream.type == 'video')
 		assert (video_stream.codec_context.width, video_stream.codec_context.height) == expected_size
 		assert video_stream.codec_context.name == 'h264'
@@ -104,18 +107,21 @@ def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypat
 
 	def fake_compress(
 		source: Path,
+		dest: Path,
 		encoder_name: str,
 		target_short_side: int | None = None,
 		encoding_profile: dict[str, str | int] | None = None,
-	) -> bytes:
+	) -> None:
 		attempted.append(encoder_name)
 		if encoder_name == 'libx264':
-			return b'final-output'
+			dest.write_bytes(b'final-output')
+			return
 		raise RuntimeError('encoder unavailable')
 
 	monkeypatch.setattr(converter, '_compress_with_encoder', fake_compress)
 
-	output = converter.process(tmp_path / 'source.mp4', tmp_path / 'resolutions' / 'clip.240p.mp4')
+	dest = tmp_path / 'out.mp4'
+	converter.process(tmp_path / 'source.mp4', tmp_path / 'resolutions' / 'clip.240p.mp4', dest)
 
-	assert output == b'final-output'
+	assert dest.read_bytes() == b'final-output'
 	assert attempted == ['h264_nvenc', 'h264_qsv', 'libx264']

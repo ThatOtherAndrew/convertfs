@@ -19,15 +19,17 @@ def test_images_converter_png_to_jpeg(tmp_path: Path) -> None:
 	source = tmp_path / 'sample.png'
 	_write_sample_image(source)
 
-	output = ImagesConverter().process(source, tmp_path / 'sample.jpg')
+	dest = tmp_path / 'sample.jpg'
+	ImagesConverter().process(source, tmp_path / 'sample.jpg', dest)
 
-	assert output[:3] == b'\xff\xd8\xff'
+	assert dest.read_bytes()[:3] == b'\xff\xd8\xff'
 
 
 def test_images_converter_jpeg_to_png(tmp_path: Path) -> None:
 	source = tmp_path / 'sample.jpg'
 	_write_sample_image(source)
 
-	output = ImagesConverter().process(source, tmp_path / 'sample.png')
+	dest = tmp_path / 'sample.png'
+	ImagesConverter().process(source, tmp_path / 'sample.png', dest)
 
-	assert output[:8] == b'\x89PNG\r\n\x1a\n'
+	assert dest.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n'

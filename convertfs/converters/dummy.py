@@ -11,5 +11,5 @@ class DummyConverter(Converter):
     OUTPUT_FILES = (Path('{}.txt.copy'),)
 
     @override
-    def process(self, source: Path, requested: Path) -> bytes:
-        return b'lol hi'
+    def process(self, source: Path, requested: Path, dest: Path) -> None:
+        dest.write_bytes(b'lol hi')

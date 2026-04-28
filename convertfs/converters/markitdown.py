@@ -21,5 +21,6 @@ class MarkItDownDocuments(Converter):
     md = MarkItDown(enable_plugins=True)
 
     @override
-    def process(self, source: Path, requested: Path) -> bytes:
-        return self.md.convert(str(source)).text_content.encode('utf-8')
+    def process(self, source: Path, requested: Path, dest: Path) -> None:
+        text = self.md.convert(str(source)).text_content
+        dest.write_text(text, encoding='utf-8')
