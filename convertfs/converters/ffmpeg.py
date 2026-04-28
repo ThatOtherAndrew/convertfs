@@ -1,7 +1,7 @@
 import re
+import shutil
 from pathlib import Path
 
-import av
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -19,8 +19,14 @@ class FFMpegConverter(Converter):
     def process(self, source: Path, requested: Path, dest: Path) -> None:
         output_ext = requested.suffix.lstrip('.')
 
+        if source.suffix.lstrip('.').lower() == output_ext.lower():
+            shutil.copyfile(source, dest)
+            return
+
         format_map = {'mp4': 'mp4', 'avi': 'avi', 'mkv': 'matroska'}
         output_format = format_map[output_ext]
+
+        import av
 
         with (
             av.open(str(source), 'r') as input_container,

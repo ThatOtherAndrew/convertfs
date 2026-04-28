@@ -2,8 +2,6 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
-import av
-
 from convertfs.converter import Converter
 
 
@@ -95,8 +93,20 @@ class VideoCompresserH264(Converter):
         },
     }
 
+    # Cache of probed encoders. Populated on first call to
+    # _encoder_candidates and reused thereafter — the underlying device
+    # nodes don't appear or disappear during a process lifetime, so the
+    # filesystem probes don't need to repeat per conversion.
+    _encoder_cache: ClassVar[tuple[str, ...] | None] = None
+
+    @classmethod
+    def _encoder_candidates(cls) -> tuple[str, ...]:
+        if cls._encoder_cache is None:
+            cls._encoder_cache = cls._probe_encoders()
+        return cls._encoder_cache
+
     @staticmethod
-    def _encoder_candidates() -> tuple[str, ...]:
+    def _probe_encoders() -> tuple[str, ...]:
         candidates: list[str] = []
 
         if (
@@ -124,6 +134,10 @@ class VideoCompresserH264(Converter):
         target_short_side: int | None = None,
         encoding_profile: dict[str, str | int] | None = None,
     ) -> None:
+        # Lazy: PyAV is a heavy native import. Defer until a compression
+        # job actually runs so the import cost doesn't land on startup.
+        import av
+
         with av.open(str(source), 'r') as input_container:
             video_stream = next(
                 (
