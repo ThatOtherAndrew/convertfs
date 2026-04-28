@@ -42,6 +42,41 @@ Then, `mv` or drag files into the directory to be magically converted!
 3. Text files
 	- Convert PDF and Office files to markdown via Microsoft's `markitdown` library.
 
+## Always-on service (systemd)
+Run convertfs as a `systemd --user` service so it mounts at login and shows up in your file manager automatically.
+
+1. Install the system prerequisites:
+
+```shell
+sudo apt install libfuse3-dev pkg-config libvips42
+```
+
+2. From the repo root, run the installer:
+
+```shell
+./scripts/install-service.sh                 # mounts at ~/convert
+./scripts/install-service.sh ~/somewhere     # or pick your own path
+```
+
+The script runs `uv sync`, writes `~/.config/systemd/user/convertfs.service`, and enables it immediately.
+
+3. (Optional) Keep the mount alive even when you're logged out:
+
+```shell
+sudo loginctl enable-linger "$USER"
+```
+
+4. Manage the service with:
+
+```shell
+systemctl --user status convertfs
+journalctl --user -u convertfs -f
+systemctl --user restart convertfs
+systemctl --user disable --now convertfs    # stop autostart
+```
+
+5. To make the mount appear in the GNOME Files sidebar, open it once and press `Ctrl+D` to bookmark it.
+
 ## Development
 1. `nix develop` to setup a development environment
 2. `uv sync` to isntall dependencies
