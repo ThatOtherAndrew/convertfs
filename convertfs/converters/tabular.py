@@ -35,6 +35,12 @@ class TabularConverter(Converter):
         src_ext = source.suffix.lstrip('.').lower()
         out_ext = requested.suffix.lstrip('.').lower()
 
+        # No-op: same format in and out. Skip the read/write round-trip;
+        # for xlsx in particular this also preserves multi-sheet layouts
+        # and formulas that the openpyxl read+write pipeline would lose.
+        if src_ext == out_ext:
+            return source.read_bytes()
+
         rows = list(self._read(source, src_ext))
         return self._write(rows, out_ext)
 

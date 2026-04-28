@@ -141,6 +141,14 @@ class ImagesConverter(Converter):
             msg = f'Unsupported output format: {requested_ext}'
             raise ValueError(msg)
 
+        # No-op: source and requested format are the same. Skip re-encoding
+        # so JPEG/WebP/AVIF round-trips don't lose quality and PNG/TIFF
+        # round-trips don't pay the encode cost.
+        source_ext = source.suffix.lstrip('.').lower()
+        source_format = self._FORMAT_ALIASES.get(source_ext, source_ext)
+        if source_format == output_format:
+            return source.read_bytes()
+
         image = pyvips.Image.new_from_file(str(source), access='sequential')
         if output_format == 'jpeg':
             return image.write_to_buffer('.jpg[Q=90]')

@@ -52,14 +52,23 @@ class ArchivesConverter(Converter):
 
     @override
     def process(self, source: Path, requested: Path) -> bytes:
-        members = _read_archive(source)
-
         top = requested.parts[0] if len(requested.parts) > 1 else ''
         name = requested.name
 
         if top == 'formats':
             fmt = _strip_known_suffix(name, _FORMATS)
+            # No-op: input and output are the same archive format
+            # (treating tar.gz/tgz, tar.bz2/tbz2, tar.xz/txz as equivalent).
+            # Skip extracting + recompressing every member when the user
+            # is just asking for the same archive under the formats/ dir.
+            if _normalise_format(fmt) == _normalise_format(
+                _strip_known_suffix(source.name, _FORMATS)
+            ):
+                return source.read_bytes()
+            members = _read_archive(source)
             return _write_archive(members, fmt, level=None)
+
+        members = _read_archive(source)
 
         if top == 'compression':
             level_match = re.search(r'\.(fast|balanced|max)\.(zip|7z)$', name)
@@ -81,6 +90,12 @@ def _strip_known_suffix(name: str, suffixes: tuple[str, ...]) -> str:
             return suffix
     msg = f'Unsupported archive format suffix in: {name}'
     raise ValueError(msg)
+
+
+def _normalise_format(fmt: str) -> str:
+    """Collapse tgz/tbz2/txz aliases to their canonical tar.<comp> form."""
+    aliases = {'tgz': 'tar.gz', 'tbz2': 'tar.bz2', 'txz': 'tar.xz'}
+    return aliases.get(fmt, fmt)
 
 
 def _read_archive(source: Path) -> list[tuple[str, bytes]]:

@@ -94,6 +94,11 @@ class AudioConverter(Converter):
 
         if top == 'formats':
             ext = requested.suffix.lstrip('.').lower()
+            # No-op: same format requested as source. Skip re-encode so
+            # lossy formats (mp3, opus, m4a, aac, ogg) don't take a
+            # generation-loss hit on a round-trip.
+            if source.suffix.lstrip('.').lower() == ext:
+                return source.read_bytes()
             return self._transcode(source, ext)
 
         if top == 'quality':

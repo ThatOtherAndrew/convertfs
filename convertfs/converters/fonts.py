@@ -42,6 +42,15 @@ class FontsConverter(Converter):
             msg = f'Unsupported font output: {out_ext}'
             raise ValueError(msg)
 
+        # No-op: same flavor (or a ttf/otf swap, which is identical at the
+        # SFNT container level — fontTools only updates sfntVersion based
+        # on the table set, which doesn't change here). Skip the parse +
+        # repack; the woff/woff2 cases still need fontTools to (re)apply
+        # the compression wrapper.
+        src_ext = source.suffix.lstrip('.').lower()
+        if src_ext == out_ext or {src_ext, out_ext} == {'ttf', 'otf'}:
+            return source.read_bytes()
+
         font = TTFont(str(source))
         font.flavor = self._FLAVOR_BY_EXT[out_ext]
         buf = io.BytesIO()
