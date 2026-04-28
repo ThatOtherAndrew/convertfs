@@ -21,7 +21,7 @@ pip install git+https://github.com/ThatOtherAndrew/convertfs
 Or, if using `uv`:
 
 ```shell
-pip install git+https://github.com/ThatOtherAndrew/convertfs
+uv pip install git+https://github.com/ThatOtherAndrew/convertfs
 ```
 
 ## Usage
