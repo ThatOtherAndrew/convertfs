@@ -108,6 +108,15 @@ class FUSE(Operations):
         self._cache_dir = Path(tempfile.mkdtemp(prefix='convertfs-cache-'))
         self.logger.debug('converter output cache dir: %s', self._cache_dir)
 
+        # Bound concurrent conversions to the CPU count. trio's default
+        # thread limiter is 40, which would let many CPU-bound encode jobs
+        # oversubscribe and thrash; sizing to cpu_count lets independent
+        # virtuals (e.g. several `resolutions/`) run in true parallel
+        # without piling up on the scheduler.
+        cpu = os.cpu_count() or 4
+        self._convert_limiter = trio.CapacityLimiter(cpu)
+        self.logger.debug('converter concurrency limit: %d', cpu)
+
         # Run the eager scan of the underlying directory before any FUSE
         # ops can arrive. (pyfuse3 hasn't started its loop yet at this
         # point — Operations.__init__ is called synchronously during
@@ -598,7 +607,7 @@ class FUSE(Operations):
             converter.process(Path(proc_path), virtual_path, dest)
 
         try:
-            await trio.to_thread.run_sync(_run)
+            await trio.to_thread.run_sync(_run, limiter=self._convert_limiter)
         except pyfuse3.FUSEError:
             with contextlib.suppress(FileNotFoundError, OSError):
                 dest.unlink()
