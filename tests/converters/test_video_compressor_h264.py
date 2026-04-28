@@ -119,3 +119,50 @@ def test_video_compressor_h264_tries_hardware_encoders_then_falls_back(monkeypat
 
 	assert output == b'final-output'
 	assert attempted == ['h264_nvenc', 'h264_qsv', 'libx264']
+
+
+def test_video_compressor_h264_encoder_probe_is_cached(
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	# The class-level cache should mean _probe_encoders only runs once
+	# regardless of how many process() calls happen.
+	import convertfs.converters.video_compressor_h264 as mod
+
+	# Reset cache so prior tests don't taint this run, then count probes.
+	mod.VideoCompresserH264._encoder_cache = None
+	probe_calls = []
+	original_probe = mod.VideoCompresserH264._probe_encoders
+
+	def counting_probe() -> tuple[str, ...]:
+		probe_calls.append(1)
+		return original_probe()
+
+	monkeypatch.setattr(
+		mod.VideoCompresserH264, '_probe_encoders', staticmethod(counting_probe),
+	)
+
+	first = mod.VideoCompresserH264._encoder_candidates()
+	second = mod.VideoCompresserH264._encoder_candidates()
+	third = mod.VideoCompresserH264._encoder_candidates()
+
+	assert first == second == third
+	assert len(probe_calls) == 1
+
+
+def test_video_compressor_h264_libx264_is_always_a_candidate(
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	# The software fallback must always be present, even on hosts with
+	# no hardware encoders — otherwise process() would fail outright on
+	# CI machines without /dev/nvidiactl or /dev/dri/renderD128.
+	import convertfs.converters.video_compressor_h264 as mod
+
+	mod.VideoCompresserH264._encoder_cache = None
+	# Force every device-probe to return False.
+	monkeypatch.setattr(Path, 'exists', lambda self: False)
+
+	candidates = mod.VideoCompresserH264._encoder_candidates()
+
+	assert candidates == ('libx264',)
+	# Reset for downstream tests.
+	mod.VideoCompresserH264._encoder_cache = None
