@@ -79,6 +79,14 @@ class ImagesConverter(Converter):
     _FLAT_FORMATS: ClassVar[frozenset[str]] = frozenset(
         {'png', 'jpeg', 'webp', 'tiff', 'bmp', 'gif', 'heic', 'avif'}
     )
+    # Formats the libvips build we ship cannot save (no bmpsave/heifsave
+    # in the binary wheel). For these we round-trip through Pillow:
+    # libvips decodes the source, we hand the raw pixels to Pillow, and
+    # Pillow writes the output. pillow-heif registers as the HEIF saver
+    # for the .heic extension.
+    _PILLOW_OUTPUT_FORMATS: ClassVar[frozenset[str]] = frozenset(
+        {'bmp', 'heic'}
+    )
 
     _QUALITY_LEVELS: ClassVar[dict[str, int]] = {
         'very-low': 40,
@@ -151,6 +159,12 @@ class ImagesConverter(Converter):
         if source_format == output_format:
             return source.read_bytes()
 
+        # Pillow fallback for formats libvips can't save in the wheel
+        # build (bmp, heic). Decode with libvips for speed, encode with
+        # Pillow for compatibility.
+        if output_format in self._PILLOW_OUTPUT_FORMATS:
+            return self._save_via_pillow(source, output_format)
+
         # Lazy: pyvips pulls in libvips bindings (a few MB of native code)
         # at import time. Keep it off startup so users that never touch
         # images don't pay for it. Python caches the import after the
@@ -161,6 +175,41 @@ class ImagesConverter(Converter):
         if output_format == 'jpeg':
             return image.write_to_buffer('.jpg[Q=90]')
         return image.write_to_buffer(f'.{output_format}')
+
+    @staticmethod
+    def _save_via_pillow(source: Path, output_format: str) -> bytes:
+        """Encode `source` as `output_format` (bmp|heic) through Pillow.
+
+        Pillow can read what libvips writes (and the other way round) for
+        every input format the converter accepts, so we don't need to
+        bridge raw pixels — Pillow opens the source path directly.
+        """
+        import io
+
+        # Lazy: Pillow + pillow-heif each pull in native libs; only load
+        # them when a bmp/heic output is actually requested.
+        from PIL import Image
+
+        if output_format == 'heic':
+            # pillow-heif registers a HEIF saver under format='HEIF';
+            # the .heic and .heif containers are the same MIAF/ISO box
+            # structure, so this produces a valid .heic file.
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+            pil_format = 'HEIF'
+        else:
+            pil_format = output_format.upper()
+
+        with Image.open(str(source)) as image:
+            # JPEG/HEIF require an RGB-family mode; convert anything
+            # exotic (e.g. palette, CMYK) up front so the save doesn't
+            # error out.
+            if image.mode not in ('RGB', 'RGBA', 'L'):
+                image = image.convert('RGB')
+            buf = io.BytesIO()
+            image.save(buf, format=pil_format)
+            return buf.getvalue()
 
     def _process_quality(self, source: Path, requested: Path) -> bytes:
         match = re.search(

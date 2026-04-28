@@ -53,12 +53,10 @@ def test_images_converter_jpeg_to_png(tmp_path: Path) -> None:
 		('tiff', b'II*\x00'),
 		('gif', b'GIF8'),
 		('avif', b''),  # ftyp box at offset 4; checked separately below
-		# bmp and heic are advertised in OUTPUT_FILES but libvips on
-		# typical builds (including the wheel pyvips ships) cannot
-		# actually save these via the buffer path used by the converter.
-		# Marked xfail so the gap is visible without breaking CI.
-		pytest.param('bmp', b'BM', marks=pytest.mark.xfail(strict=True, reason='libvips lacks bmpsave_buffer')),
-		pytest.param('heic', b'', marks=pytest.mark.xfail(strict=True, reason='libvips heifsave: Unsupported compression')),
+		('bmp', b'BM'),
+		# heic uses the ISO BMFF container, same ftyp-at-offset-4
+		# structure as avif; checked in the heic-specific branch.
+		('heic', b''),
 	],
 )
 def test_images_converter_png_to_each_flat_format(
@@ -69,8 +67,7 @@ def test_images_converter_png_to_each_flat_format(
 
 	output = ImagesConverter().process(source, tmp_path / f'sample.{out_ext}')
 
-	if out_ext == 'avif':
-		# AVIF wraps an HEIF/MIAF box; "ftyp" appears at offset 4.
+	if out_ext in ('avif', 'heic'):
 		assert output[4:8] == b'ftyp'
 		return
 	assert output[: len(magic)] == magic
