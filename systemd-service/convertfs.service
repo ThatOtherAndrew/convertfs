@@ -1,0 +1,14 @@
+[Unit]
+Description=convertfs FUSE filesystem
+After=default.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=uv run --project %h/Dev/convertfs convertfs %h/convert
+Restart=on-failure
+RestartSec=2
+ExecStopPost=/usr/bin/fusermount3 -u -z %h/convert
+
+[Install]
+WantedBy=default.target
