@@ -2,7 +2,6 @@ import io
 import re
 from pathlib import Path
 
-import av
 from typing_extensions import override
 
 from convertfs.converter import Converter
@@ -20,8 +19,20 @@ class FFMpegConverter(Converter):
     def process(self, source: Path, requested: Path) -> bytes:
         output_ext = requested.suffix.lstrip('.')
 
+        # No-op: same container in and out. The existing path is a stream
+        # copy via add_stream_from_template, so the only thing skipping
+        # avoids is rewriting the headers — but that's a per-file decode
+        # of every packet for no end-user benefit. Just return the source.
+        if source.suffix.lstrip('.').lower() == output_ext.lower():
+            return source.read_bytes()
+
         format_map = {'mp4': 'mp4', 'avi': 'avi', 'mkv': 'matroska'}
         output_format = format_map[output_ext]
+
+        # Lazy: PyAV pulls in the full FFmpeg shared libraries (tens of MB
+        # of native code) at import time. Defer until we actually need to
+        # remux so startup stays fast for users that never touch video.
+        import av
 
         buffer = io.BytesIO()
 
