@@ -6,9 +6,16 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "av>=17.0.1",
+    "fonttools[woff]>=4.55.0",
+    "markdown>=3.7",
     "markitdown[all]>=0.1.5",
+    "openpyxl>=3.1.5",
+    "py7zr>=0.22.0",
     "pyfuse3>=3.4.2",
+    "pysubs2>=1.7.3",
     "pyvips[binary]>=3.1.1",
+    "pyyaml>=6.0.2",
+    "tomli-w>=1.0.0",
     "trio>=0.33.0",
     "typing-extensions>=4.15.0",
 ]
