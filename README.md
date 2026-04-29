@@ -12,6 +12,12 @@ The idea if you copy a file into a directory that convertfs is mounted on, and t
 4. `uv run convertfs --mount <mountpoint>` to start the filesystem, and then you can copy files into the mountpoint to convert them.
 
 ## Installation
+Before installing, make sure the system FUSE development packages are available. On Debian/Ubuntu, this usually means:
+
+```shell
+sudo apt install pkg-config libfuse3-dev fuse3
+```
+
 You can install with the following command:
 
 ```shell
