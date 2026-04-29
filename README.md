@@ -18,10 +18,16 @@ You can install with the following command:
 pip install git+https://github.com/ThatOtherAndrew/convertfs
 ```
 
+For an isolated CLI install, use `pipx`:
+
+```shell
+pipx install git+https://github.com/ThatOtherAndrew/convertfs
+```
+
 Or, if using `uv`:
 
 ```shell
-uv pip install git+https://github.com/ThatOtherAndrew/convertfs
+uv tool install git+https://github.com/ThatOtherAndrew/convertfs
 ```
 
 ## Usage
